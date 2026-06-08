@@ -1,0 +1,6 @@
+# Generated notice/helper files we don't want:
+.travis.yml
+git_push.sh
+
+# Hand-maintained files that must not be overwritten on regeneration:
+README.md
