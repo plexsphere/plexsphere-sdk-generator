@@ -371,33 +371,103 @@ echo ">> Lock:   ${SPEC_LOCK} (sha256=${SHA:0:12}…, apiVersion=${API_VERSION})
 
 ---
 
-### Step 3 — `scripts/validate-spec.sh`
+### Step 3 — `scripts/validate-spec.sh` & `scripts/_fetch_jar.sh`
 
-Uses the generator itself to validate (no extra tool required). Optionally
+Validation uses the generator itself (no extra tool required). Because the jar download is
+shared with the orchestrator (`generate-sdk.sh`, Step 4), it is factored into a small sourced
+helper, `scripts/_fetch_jar.sh`, rather than copy-pasted into both callers.
+
+`scripts/_fetch_jar.sh` exposes one function, `fetch_jar VERSION`: it downloads the pinned
+`openapi-generator-cli-<version>.jar` from Maven Central into `bin/` (gitignored) on demand —
+idempotent, so an already-present jar is reused — and prints its path. It rejects generators
+older than 7.x, because the spec is OpenAPI 3.1 (see [Prerequisites](#prerequisites)).
+
+```bash
+#!/usr/bin/env bash
+#
+# _fetch_jar.sh — make the pinned OpenAPI Generator jar available in bin/.
+#
+# Sourced (not executed) by the scripts that need the generator —
+# validate-spec.sh and, later, generate-sdk.sh — so the download lives in one
+# place. It provides a single function:
+#
+#   fetch_jar VERSION
+#       Ensure bin/openapi-generator-cli-VERSION.jar exists, downloading it from
+#       Maven Central on demand, and print its path on stdout. The download is
+#       idempotent: an already-present jar is reused, never re-fetched. Progress
+#       goes to stderr so the path can be captured with $(fetch_jar VERSION).
+#
+# VERSION must be >= 7.x: the plexsphere spec is OpenAPI 3.1 and generators
+# before 7.x mishandle it (see README §Prerequisites).
+
+fetch_jar() {
+  local version="${1:?fetch_jar: generator version must be set (>=7.x for OpenAPI 3.1)}"
+
+  # Reject generators older than 7.x — they silently mishandle OpenAPI 3.1.
+  local major="${version%%.*}"
+  if ! [[ "$major" =~ ^[0-9]+$ ]] || [ "$major" -lt 7 ]; then
+    echo "! Unsupported generator version '${version}': need >=7.x for OpenAPI 3.1." >&2
+    return 1
+  fi
+
+  local jar="bin/openapi-generator-cli-${version}.jar"
+  local url="https://repo1.maven.org/maven2/org/openapitools/openapi-generator-cli/${version}/openapi-generator-cli-${version}.jar"
+
+  if [ ! -f "$jar" ]; then
+    echo ">> Downloading openapi-generator-cli ${version}" >&2
+    mkdir -p bin
+    # Remove a partial jar on failure so a later run does not skip a corrupt file.
+    curl -fsSL "$url" -o "$jar" || { rm -f "$jar"; return 1; }
+  fi
+
+  printf '%s\n' "$jar"
+}
+```
+
+`scripts/validate-spec.sh` sources the helper and runs `validate --recommend`. Optionally
 [Spectral](https://github.com/stoplightio/spectral) can be hooked in here as well.
 
 ```bash
 #!/usr/bin/env bash
+#
+# validate-spec.sh — validate the vendored plexsphere OpenAPI spec.
+#
+# Makes the pinned OpenAPI Generator jar available (via scripts/_fetch_jar.sh)
+# and runs `openapi-generator validate --recommend` against $SPEC_FILE. The
+# generator is the only tool required; no extra linter is needed.
+#
+# Invoked by `make validate-spec`.
 set -euo pipefail
 
 SPEC_FILE="${SPEC_FILE:-spec/plexsphere-v1.yaml}"
-GENERATOR_VERSION="${GENERATOR_VERSION:?GENERATOR_VERSION must be set}"
-JAR="bin/openapi-generator-cli-${GENERATOR_VERSION}.jar"
+GENERATOR_VERSION="${GENERATOR_VERSION:?GENERATOR_VERSION must be set (>=7.x for OpenAPI 3.1)}"
 
-if [ ! -f "$JAR" ]; then
-  echo ">> Downloading openapi-generator-cli ${GENERATOR_VERSION}"
-  mkdir -p bin
-  curl -fsSL \
-    "https://repo1.maven.org/maven2/org/openapitools/openapi-generator-cli/${GENERATOR_VERSION}/openapi-generator-cli-${GENERATOR_VERSION}.jar" \
-    -o "$JAR"
-fi
+# Anchor to the repo root so the relative bin/ and spec/ paths resolve no matter
+# where the script is invoked from.
+ROOT_DIR="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$ROOT_DIR"
+
+command -v java >/dev/null 2>&1 || { echo "! Java not installed (OpenAPI Generator needs a JRE)." >&2; exit 1; }
+[ -f "$SPEC_FILE" ] || { echo "! Spec ${SPEC_FILE} missing. Run 'make download-spec' first." >&2; exit 1; }
+
+# shellcheck source=scripts/_fetch_jar.sh
+source scripts/_fetch_jar.sh
+JAR="$(fetch_jar "$GENERATOR_VERSION")"
 
 echo ">> Validating ${SPEC_FILE}"
 java -jar "$JAR" validate --recommend -i "$SPEC_FILE"
 ```
 
-> The jar download is repeated in `generate-sdk.sh`; if you prefer, extract it into a small
-> `scripts/_fetch_jar.sh` and source it from both places.
+`chmod +x scripts/validate-spec.sh scripts/_fetch_jar.sh` (the helper is sourced, but the
+executable bit is harmless and keeps the scripts uniform).
+
+> **Note — vendored-spec validation status:** under the pinned generator (`7.22.0`),
+> `validate` reports one **error** — `attribute info.license.identifier is missing` — because the
+> vendored spec deliberately uses a `name`-only license (`spec/plexsphere-v1.yaml`, for
+> kin-openapi compatibility) and `validate` exposes no flag to downgrade the check. So
+> `make validate-spec` currently exits non-zero on the vendored spec. Whether to add an SPDX
+> `identifier` to the spec or to treat this single check as non-fatal is a spec/policy decision,
+> separate from this script.
 
 ---
 
