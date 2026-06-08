@@ -173,6 +173,7 @@ plexsphere-sdk-generator/
 │
 ├── scripts/
 │   ├── download-spec.sh          # download, verify, pin the spec
+│   ├── _fetch_jar.sh             # shared: fetch pinned generator jar into bin/
 │   ├── validate-spec.sh          # validate the spec (+ optional lint)
 │   ├── generate-sdk.sh           # orchestrator: pick version, fetch jar, dispatch
 │   └── languages/
