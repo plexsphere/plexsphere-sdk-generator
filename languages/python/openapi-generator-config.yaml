@@ -1,0 +1,8 @@
+# Python generator options. Full list: config-help -g python
+additionalProperties:
+  packageName: plexsphere
+  projectName: plexsphere-sdk
+  library: urllib3                # default HTTP backend
+  generateSourceCodeOnly: false
+  disallowAdditionalPropertiesIfNotPresent: false
+# templateDir: languages/python/templates
