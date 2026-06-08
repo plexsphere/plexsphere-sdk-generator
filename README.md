@@ -287,12 +287,24 @@ generate-%: ## Generate the SDK for <lang> (e.g. make generate-go)
 
 ### Step 2 — `scripts/download-spec.sh`
 
-Downloads the spec, writes it into `spec/`, computes the SHA-256, and creates a lock file
-for reproducibility. (Optional: inject a `servers` block here — see
-[no `servers` block](#no-servers-block).)
+Downloads the spec into `spec/`, computes the SHA-256, reads `info.version`, and writes a lock
+file for reproducibility. Re-running against an unchanged spec preserves `fetchedAt` and
+produces a byte-identical lock, so CI can assert that `make download-spec` leaves no diff (see
+[Versioning & reproducibility](#versioning--reproducibility)). (Optional: inject a `servers`
+block here — see [no `servers` block](#no-servers-block).)
 
 ```bash
 #!/usr/bin/env bash
+#
+# download-spec.sh — download, vendor and pin the plexsphere OpenAPI spec.
+#
+# Fetches $SPEC_URL into $SPEC_FILE, computes its SHA-256 (cross-platform),
+# reads info.version out of the spec, and writes $SPEC_LOCK pinning the spec for
+# reproducible generation. Re-running against an unchanged spec produces a
+# byte-identical lock, so CI can assert that `make download-spec` leaves no diff
+# (see README §"Versioning & reproducibility").
+#
+# Invoked by `make download-spec`.
 set -euo pipefail
 
 SPEC_URL="${SPEC_URL:?SPEC_URL must be set}"
@@ -304,17 +316,41 @@ mkdir -p "$(dirname "$SPEC_FILE")"
 echo ">> Downloading spec from ${SPEC_URL}"
 curl -fsSL "$SPEC_URL" -o "$SPEC_FILE"
 
-# sha256 cross-platform
+# Optional: inject a `servers` block here. Deliberately left disabled — the spec
+# omits `servers` because the host is environment-dependent (dev/staging/prod/
+# on-prem), so callers set the base URL at runtime. Only enable this if a
+# sensible default URL actually exists, otherwise it is misleading. See README
+# §"No servers block".
+#
+#   yq -i '.servers = [{"url": "https://api.plexsphere.com"}]' "$SPEC_FILE"
+
+# SHA-256, cross-platform (Linux coreutils vs. macOS/BSD).
 if command -v sha256sum >/dev/null 2>&1; then
   SHA="$(sha256sum "$SPEC_FILE" | awk '{print $1}')"
 else
   SHA="$(shasum -a 256 "$SPEC_FILE" | awk '{print $1}')"
 fi
 
-# Pull the API version from the spec (info.version), fall back to "unknown"
+# Pull the API version from the spec (info.version); fall back to "unknown".
 API_VERSION="$(grep -m1 -E '^  version:' "$SPEC_FILE" | sed -E 's/.*version:[[:space:]]*//' | tr -d '"' || true)"
 API_VERSION="${API_VERSION:-unknown}"
-FETCHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# Reuse the previous fetchedAt when the spec is byte-identical, so the lock stays
+# stable across re-runs; only stamp a new time when the spec actually changed.
+prev_lock_field() {
+  # Read a string field from our own fixed-format lock JSON (keeps jq optional).
+  local key="$1"
+  [ -f "$SPEC_LOCK" ] || return 0
+  sed -n -E "s/^[[:space:]]*\"${key}\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p" "$SPEC_LOCK" | head -n1
+}
+
+PREV_SHA="$(prev_lock_field sha256 || true)"
+PREV_FETCHED_AT="$(prev_lock_field fetchedAt || true)"
+if [ -n "$PREV_FETCHED_AT" ] && [ "$SHA" = "$PREV_SHA" ]; then
+  FETCHED_AT="$PREV_FETCHED_AT"
+else
+  FETCHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+fi
 
 cat > "$SPEC_LOCK" <<EOF
 {
