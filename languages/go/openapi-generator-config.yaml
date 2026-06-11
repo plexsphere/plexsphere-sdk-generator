@@ -7,5 +7,8 @@ additionalProperties:
   generateInterfaces: true        # testable API interfaces
   disallowAdditionalPropertiesIfNotPresent: false
   enumUnknownDefaultCase: true    # forward-compatible with new enum values
-# Custom Mustache templates (optional, add only when needed):
-# templateDir: languages/go/templates
+# Custom Mustache templates. Only files present here override the generator's
+# embedded defaults; everything else still uses the built-in templates.
+# api.mustache is overridden so descriptions containing the Go block-comment
+# terminator do not break the generated SDK — see the header in that file.
+templateDir: languages/go/templates
