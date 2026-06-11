@@ -749,24 +749,54 @@ Two strategies:
 
    Only do this if a sensible default URL actually exists; otherwise it's misleading.
 
-### Authentication: Bearer + cookie/CSRF
+### Authentication: Bearer (the SDK default) + cookie/CSRF
 
-The spec declares a security scheme `operatorBearer` (HTTP Bearer, JWT). The generator
-produces this correctly — callers set an access token, sent as `Authorization: Bearer …`.
+> **Decision (issue #7).** The generated Go and Python SDKs are **bearer-only**. plexsphere
+> operator/machine clients authenticate with a bearer token; the cookie+CSRF flow is a
+> browser-session concern and is deliberately **not** generated. No CSRF template override
+> ships under `languages/{go,python}/templates/`, so there is nothing extra for the
+> per-language `.openapi-generator-ignore` to protect. Rationale below.
 
-**Not** modeled (only documented in the spec's description) is the **cookie+CSRF flow**:
-state-changing, cookie-authenticated `/v1/*` requests must additionally echo the
-`plexsphere_csrf` cookie in the `X-Plexsphere-CSRF` header and send an Origin/`Sec-Fetch-Site`
-signal; otherwise `403 application/problem+json`. Bearer requests are exempt.
+**Bearer works out of the box.** The spec declares the security scheme `operatorBearer`
+(HTTP Bearer, JWT) and applies it to the operator endpoints, so the generator emits the
+`Authorization: Bearer …` path with no override — the caller only supplies the token:
 
-Since this is not an OpenAPI security scheme, the generator produces **nothing** for it.
-Options:
+```go
+// Go: carry the token in the request context (plexsphere.ContextAccessToken).
+ctx := context.WithValue(context.Background(), plexsphere.ContextAccessToken, "<token>")
+// resp, httpResp, err := client.<Tag>API.<Operation>(ctx).Execute()
+```
 
-- **Recommended for SDKs:** use bearer/token auth (the common case for machine/operator
-  clients) — then no CSRF is needed.
-- **If cookie auth is required:** add a small request interceptor as a **template override**
-  (in `languages/<lang>/templates/`) that sets `X-Plexsphere-CSRF` from the cookie. Protect
-  such hand-maintained spots via `.openapi-generator-ignore`.
+```python
+# Python: set the token on the Configuration (access_token).
+configuration = plexsphere.Configuration(host="https://…", access_token="<token>")
+# with plexsphere.ApiClient(configuration) as api_client: ...
+```
+
+The SDK READMEs (plexsphere-sdk-go#2, plexsphere-sdk-python#2) document end-user usage; the
+snippets above are the contract they build on.
+
+**Why no CSRF override.** The spec's CSRF defence-in-depth (its top-level `description` and
+the `Problem.code` taxonomy) requires state-changing **cookie-authenticated** `/v1/*`
+requests to echo the `plexsphere_csrf` cookie in the `X-Plexsphere-CSRF` header and carry an
+`Origin`/`Sec-Fetch-Site` signal, otherwise `403 application/problem+json`. It is not an
+OpenAPI security scheme, so the generator emits nothing for it — which is correct here:
+
+- The spec **exempts bearer-authenticated requests** from CSRF (browsers do not auto-attach
+  `Authorization`). A bearer-only SDK makes only exempt requests.
+- The `plexsphere_csrf` cookie is minted by the interactive sign-in flow and held by a
+  browser session; a machine client never receives it, so it has nothing to echo.
+- Echoing it would mean forking the generator's request template for both languages — a
+  fragile, high-maintenance override (cf. the `languages/go/templates/api.mustache` header)
+  for a code path no operator SDK exercises.
+
+**If cookie auth is ever required**, add a request interceptor as a Mustache template
+override under `languages/<lang>/templates/` that copies the `plexsphere_csrf` cookie into
+the `X-Plexsphere-CSRF` header (plus the `Origin`/`Sec-Fetch-Site` signal), and list that
+file in the per-language `.openapi-generator-ignore` so regeneration preserves it — the same
+mechanism that already protects hand-maintained paths (see
+[Step 6](#step-6--language-configuration--ignore-files)). This stays optional and unbuilt
+until a cookie-auth use case appears.
 
 ### Error format `application/problem+json` (RFC 9457)
 
