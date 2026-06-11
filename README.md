@@ -198,7 +198,8 @@ plexsphere-sdk-generator/
 │
 └── .github/workflows/
     ├── validate.yaml             # PR check: validate spec
-    └── generate.yaml             # regenerate on spec update + open PRs
+    ├── update-spec.yaml          # scheduled: refresh vendored spec, open spec PR
+    └── generate.yaml             # on spec change: regenerate SDKs + open PRs
 ```
 
 ---
@@ -860,7 +861,16 @@ On breaking spec changes → major bump of the SDK.
 
 ## CI/CD & publishing
 
-Recommended GitHub Actions workflows under `.github/workflows/`:
+GitHub Actions workflows under `.github/workflows/` form a two-step, spec-driven pipeline:
+
+1. **`update-spec.yaml`** (scheduled) refreshes the vendored spec and opens a PR in *this*
+   repo when it changed.
+2. Merging that PR is a push to `spec/**`, which triggers **`generate.yaml`** to regenerate
+   the SDKs and open PRs in the SDK repos.
+
+So a spec refresh and the resulting SDK regeneration are two separately reviewable steps
+rather than one weekly black box, and the SDKs are always built from the exact spec that was
+reviewed and merged. `validate.yaml` gates spec PRs opened by hand.
 
 ### `validate.yaml` — PR gate
 
@@ -886,12 +896,52 @@ jobs:
       - run: make validate-spec
 ```
 
+### `update-spec.yaml` — refresh the vendored spec
+
+Scheduled weekly (Mondays 06:00 UTC) and runnable on demand (`workflow_dispatch`). It sets up
+Java, runs `make download-spec` to fetch and pin the upstream spec, then `make validate-spec`
+to reject a spec the pinned generator cannot parse *before* it reaches a PR. If `spec/**`
+changed, [`peter-evans/create-pull-request`](https://github.com/peter-evans/create-pull-request)
+opens — or updates — a single PR in this repo (`add-paths: spec` keeps the commit to the spec;
+the generator jar fetched into `bin/` is gitignored and never committed). The PR appears
+exactly when the upstream spec changed; merging it is what drives regeneration.
+
+This uses the built-in `GITHUB_TOKEN` (`contents: write`, `pull-requests: write`) because the
+PR stays within this repo. A PR opened by `GITHUB_TOKEN` does not itself trigger other
+workflows, so `validate.yaml` does not re-run on it — which is why the spec is validated
+inline here. When a human merges the PR, the resulting push to `main` is an ordinary event
+and triggers `generate.yaml` normally.
+
+```yaml
+name: update-spec
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"            # weekly, Mondays 06:00 UTC
+permissions:
+  contents: write                 # push the spec branch …
+  pull-requests: write            # … and open the PR (both in this repo)
+jobs:
+  update-spec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - run: make download-spec
+      - run: make validate-spec
+      # open/update a PR touching only spec/ (peter-evans/create-pull-request,
+      # pinned by SHA), so merging it triggers generate.yaml.
+```
+
 ### `generate.yaml` — regenerate & open PRs
 
-Scheduled weekly and runnable on demand (`workflow_dispatch`). A matrix job per language
-(`go`, `python`) sets up Java 17 and the language toolchain, runs `make download-spec` and
-`make generate-<lang>`, then smoke-builds the result (see
-[Tests & validation](#tests--validation)). The smoke check **gates** the pull request: a
+Triggered by a push to `spec/**` on `main` (i.e. when a spec refresh is merged) and runnable
+on demand (`workflow_dispatch`). A matrix job per language (`go`, `python`) sets up Java 17
+and the language toolchain and runs `make generate-<lang>` against the **vendored** spec — no
+re-download, so the SDKs are built from the exact spec that was reviewed and merged (see
+[Versioning & reproducibility](#versioning--reproducibility)). It then smoke-builds the result
+(see [Tests & validation](#tests--validation)). The smoke check **gates** the pull request: a
 non-building SDK fails the job before any PR is opened.
 
 On a successful build the generated `dist/<lang>/` tree is overlaid onto a checkout of the
@@ -911,8 +961,9 @@ The canonical definition is
 name: generate
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 6 * * 1"            # weekly, Mondays 06:00 UTC
+  push:
+    branches: [main]
+    paths: ["spec/**"]            # fires when a merged spec refresh lands
 permissions:
   contents: read                  # writes go to the SDK repos via SDK_PR_TOKEN
 jobs:
@@ -931,8 +982,7 @@ jobs:
       - if: matrix.lang == 'python'
         uses: actions/setup-python@v5
         with: { python-version: "3.11" }
-      - run: make download-spec
-      - run: make generate-${{ matrix.lang }}
+      - run: make generate-${{ matrix.lang }}   # vendored spec, no re-download
       # smoke-build, then overlay dist/<lang>/ into a plexsphere-sdk-<lang>
       # checkout and open/update a PR (peter-evans/create-pull-request,
       # pinned by SHA; needs the SDK_PR_TOKEN secret).

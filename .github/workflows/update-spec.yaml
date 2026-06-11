@@ -1,0 +1,65 @@
+name: update-spec
+
+# Scheduled refresh of the vendored plexsphere OpenAPI spec. Downloads the
+# upstream spec, validates it with the pinned generator, and opens (or updates)
+# a pull request in THIS repo whenever spec/** changed. Merging that PR is what
+# drives SDK regeneration: generate.yaml triggers on a push to spec/**. Splitting
+# the refresh from the regeneration turns one weekly black box into two
+# reviewable steps (see README §"CI/CD & publishing → update-spec.yaml").
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Mondays at 06:00 UTC.
+    - cron: "0 6 * * 1"
+
+# The job updates the vendored spec and opens a PR inside this repository, so it
+# needs to write the branch (contents) and the pull request. The default
+# GITHUB_TOKEN suffices because nothing leaves this repo.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-spec:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the generator
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download and pin the OpenAPI spec
+        run: make download-spec
+
+      # Validate the freshly downloaded spec before proposing it, so a spec the
+      # pinned generator rejects never reaches a PR. Mirrors generate.yaml's
+      # "smoke checks gate the PR" rule (see README §"Tests & validation").
+      - name: Validate the downloaded spec
+        run: make validate-spec
+
+      # Opens a PR only when spec/** actually changed, and updates the existing
+      # PR otherwise, so a PR appears exactly when the upstream spec changed.
+      # add-paths keeps the commit to spec/ — the validate step fetches the
+      # generator jar into bin/ (gitignored), which must not be committed.
+      # Merging this PR is what fires generate.yaml (push on spec/**).
+      - name: Open or update the spec pull request
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1  # v8.1.1
+        with:
+          add-paths: spec
+          branch: automated/update-spec
+          delete-branch: true
+          commit-message: "Update vendored plexsphere OpenAPI spec"
+          title: "Update vendored plexsphere OpenAPI spec"
+          body: |
+            Automated refresh of the vendored plexsphere OpenAPI spec.
+
+            - Source, hash and API version: see `spec/spec-lock.json`
+            - Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Opened automatically by the `update-spec` workflow. Review the spec
+            diff, then merge to trigger SDK regeneration (the `generate` workflow
+            runs on pushes to `spec/**`).

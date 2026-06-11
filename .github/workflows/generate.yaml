@@ -1,14 +1,17 @@
 name: generate
 
-# Regenerate the SDKs from the plexsphere OpenAPI spec and open (or update) a
-# pull request in the matching SDK repository whenever the generated output
-# changed. Runs weekly and on demand. This is the single-spec analogue of
-# STACKIT's sdk-pr flow (see README §"CI/CD & publishing → generate.yaml").
+# Regenerate the SDKs from the *vendored* plexsphere OpenAPI spec and open (or
+# update) a pull request in the matching SDK repository whenever the generated
+# output changed. Triggered by a change to the vendored spec on main (the spec
+# is refreshed via update-spec.yaml and lands here on merge) and runnable on
+# demand. This is the single-spec analogue of STACKIT's sdk-pr flow (see README
+# §"CI/CD & publishing → generate.yaml").
 on:
   workflow_dispatch:
-  schedule:
-    # Weekly, Mondays at 06:00 UTC.
-    - cron: "0 6 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - "spec/**"
 
 # Least privilege: the job only reads this (generator) repository. Every write
 # goes to an SDK repo through SDK_PR_TOKEN, never the workflow's GITHUB_TOKEN
@@ -47,9 +50,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Download the OpenAPI spec
-        run: make download-spec
-
+      # No download step: generate from the vendored spec committed to this repo
+      # (refreshed via update-spec.yaml), so the SDKs are built from the exact,
+      # reviewed spec — not whatever upstream happens to serve at run time. See
+      # README §"Versioning & reproducibility".
       - name: Generate the ${{ matrix.lang }} SDK
         run: make generate-${{ matrix.lang }}
 
