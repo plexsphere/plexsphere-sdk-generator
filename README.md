@@ -818,31 +818,67 @@ jobs:
 
 ### `generate.yaml` — regenerate & open PRs
 
-Scheduled (cron) or via `workflow_dispatch`: re-download the spec → if there's a diff →
-generate per language → commit the result into the respective SDK repo and open a PR (e.g.
-via `peter-evans/create-pull-request` or `gh pr create`). This mirrors STACKIT's
-`sdk-pr.yaml` + `sdk-create-pr.sh`.
+Scheduled weekly and runnable on demand (`workflow_dispatch`). A matrix job per language
+(`go`, `python`) sets up Java 17 and the language toolchain, runs `make download-spec` and
+`make generate-<lang>`, then smoke-builds the result (see
+[Tests & validation](#tests--validation)). The smoke check **gates** the pull request: a
+non-building SDK fails the job before any PR is opened.
 
-Rough sketch per language:
+On a successful build the generated `dist/<lang>/` tree is overlaid onto a checkout of the
+matching SDK repo (`plexsphere-sdk-<lang>`) and
+[`peter-evans/create-pull-request`](https://github.com/peter-evans/create-pull-request)
+opens — or updates — a single PR there. The overlay uses `rsync` **without** `--delete`, so
+files the generator deliberately omits (the SDK's hand-maintained `README.md`, protected by
+`languages/<lang>/.openapi-generator-ignore`) and repo meta (`.git/`, `.github/`) survive
+regeneration. The action commits only when the overlay produces a diff, so a PR appears
+exactly when the regenerated SDK changed. This mirrors STACKIT's `sdk-pr.yaml` +
+`sdk-create-pr.sh` for a single spec.
+
+The canonical definition is
+[`.github/workflows/generate.yaml`](.github/workflows/generate.yaml); its shape, condensed:
 
 ```yaml
 name: generate
 on:
-  workflow_dispatch: {}
-  schedule: [{ cron: "0 6 * * 1" }]   # weekly
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"            # weekly, Mondays 06:00 UTC
+permissions:
+  contents: read                  # writes go to the SDK repos via SDK_PR_TOKEN
 jobs:
   generate:
     runs-on: ubuntu-latest
     strategy:
-      matrix: { lang: [go, python, typescript] }
+      fail-fast: false
+      matrix: { lang: [go, python] }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: "17" }
+      - if: matrix.lang == 'go'
+        uses: actions/setup-go@v5
+        with: { go-version: stable }
+      - if: matrix.lang == 'python'
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
       - run: make download-spec
       - run: make generate-${{ matrix.lang }}
-      # -> push dist/${{ matrix.lang }} into the SDK repo + open a PR (needs a token/secret)
+      # smoke-build, then overlay dist/<lang>/ into a plexsphere-sdk-<lang>
+      # checkout and open/update a PR (peter-evans/create-pull-request,
+      # pinned by SHA; needs the SDK_PR_TOKEN secret).
 ```
+
+#### Required secrets
+
+| Secret | Purpose | Access required |
+|--------|---------|-----------------|
+| `SDK_PR_TOKEN` | Push the regenerated branch and open/update the PR in each SDK repo | `contents: write` **and** `pull-requests: write` on **both** `plexsphere/plexsphere-sdk-go` and `plexsphere/plexsphere-sdk-python` |
+
+Use a fine-grained Personal Access Token scoped to the two SDK repos, or a GitHub App
+installation token. The built-in `GITHUB_TOKEN` is **not** usable here: it cannot write to
+other repositories, and a PR it opened would not trigger the SDK repos' own CI gate. A token
+distinct from `GITHUB_TOKEN` is also what makes those gating workflows run on the
+regeneration PR.
 
 **Publishing** per language: Go → git tag in the SDK repo (Go modules pull straight from
 git); Python → build + `twine upload` to PyPI; TypeScript → `npm publish`. This is best done
