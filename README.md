@@ -800,14 +800,19 @@ lock.
 
 ```yaml
 name: validate
-on: { pull_request: {} }
+on:
+  pull_request:
+permissions:
+  contents: read          # read-only: the job only checks out and validates
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: "17" }
+        with:
+          distribution: temurin
+          java-version: "17"
       - run: make validate-spec
 ```
 
