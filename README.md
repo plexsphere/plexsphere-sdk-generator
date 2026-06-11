@@ -800,10 +800,40 @@ until a cookie-auth use case appears.
 
 ### Error format `application/problem+json` (RFC 9457)
 
-Error responses consistently use `application/problem+json`. The generator produces the
-corresponding models (e.g. a `Problem` schema with `type`, `title`, `status`, `detail`,
-`code`). The SDK README should explain how to deserialize the error body into this model so
-that users can act on the `code` values (`csrf-token-mismatch`, etc.).
+Every error response uses `application/problem+json`. The spec defines a single `Problem`
+schema (RFC 9457), so the generator emits one typed error model with these members:
+
+| Member     | Type    | Meaning |
+|------------|---------|---------|
+| `type`     | string  | URI reference identifying the problem class. |
+| `title`    | string  | Short, human-readable summary. |
+| `status`   | integer | HTTP status code; mirrors the response status. |
+| `detail`   | string  | Human-readable explanation for this occurrence. |
+| `instance` | string  | URI reference identifying this specific occurrence. |
+| `code`     | string  | Optional plexsphere extension: the machine-readable code clients branch on (`csrf-token-mismatch`, `domain_slug_conflict`, …). |
+
+`code` is the stable branch point — the spec enumerates a closed taxonomy per domain. The
+SDKs surface the error body as the typed `Problem`; the SDK READMEs (plexsphere-sdk-go#2,
+plexsphere-sdk-python#2) document this recipe:
+
+```go
+// Go: the returned error carries the decoded Problem model.
+var apiErr *plexsphere.GenericOpenAPIError
+if errors.As(err, &apiErr) {
+    if p, ok := apiErr.Model().(plexsphere.Problem); ok {
+        log.Printf("problem: status=%d code=%s", p.GetStatus(), p.GetCode())
+    }
+}
+```
+
+```python
+# Python: deserialize the response body into the Problem model.
+try:
+    ...
+except plexsphere.ApiException as e:
+    problem = plexsphere.Problem.from_json(e.body)
+    print(problem.status, problem.code)
+```
 
 ### BUSL-1.1 license
 
