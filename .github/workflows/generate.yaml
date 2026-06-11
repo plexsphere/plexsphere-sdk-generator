@@ -1,0 +1,103 @@
+name: generate
+
+# Regenerate the SDKs from the plexsphere OpenAPI spec and open (or update) a
+# pull request in the matching SDK repository whenever the generated output
+# changed. Runs weekly and on demand. This is the single-spec analogue of
+# STACKIT's sdk-pr flow (see README §"CI/CD & publishing → generate.yaml").
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Mondays at 06:00 UTC.
+    - cron: "0 6 * * 1"
+
+# Least privilege: the job only reads this (generator) repository. Every write
+# goes to an SDK repo through SDK_PR_TOKEN, never the workflow's GITHUB_TOKEN
+# (which has no access to the SDK repos anyway).
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    strategy:
+      # Regenerate every SDK even if one language fails, so a Go build break
+      # does not hide a Python regression (or vice versa).
+      fail-fast: false
+      matrix:
+        lang: [go, python]
+    steps:
+      - name: Check out the generator
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Go
+        if: matrix.lang == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Set up Python
+        if: matrix.lang == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download the OpenAPI spec
+        run: make download-spec
+
+      - name: Generate the ${{ matrix.lang }} SDK
+        run: make generate-${{ matrix.lang }}
+
+      # Smoke checks gate the PR: a non-building SDK fails the job here, before
+      # any pull request is opened (see README §"Tests & validation").
+      - name: Smoke-build the Go SDK
+        if: matrix.lang == 'go'
+        working-directory: dist/go
+        run: go build ./...
+
+      - name: Smoke-test the Python SDK
+        if: matrix.lang == 'python'
+        working-directory: dist/python
+        run: |
+          pip install -e .
+          python -c "import plexsphere"
+
+      - name: Check out the SDK repository
+        uses: actions/checkout@v4
+        with:
+          repository: plexsphere/plexsphere-sdk-${{ matrix.lang }}
+          token: ${{ secrets.SDK_PR_TOKEN }}
+          path: sdk-repo
+
+      # Overlay the generated files onto the SDK repo without --delete, so files
+      # the generator deliberately omits — the SDK's own README.md, protected by
+      # languages/<lang>/.openapi-generator-ignore — and repo meta (.git/,
+      # .github/) survive regeneration.
+      - name: Sync the generated SDK into the SDK repository
+        run: rsync -a dist/${{ matrix.lang }}/ sdk-repo/
+
+      # Opens a PR only when the overlay produced a diff, and updates the
+      # existing PR otherwise, so a PR appears exactly when the SDK changed.
+      - name: Open or update the SDK pull request
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1  # v8.1.1
+        with:
+          token: ${{ secrets.SDK_PR_TOKEN }}
+          path: sdk-repo
+          branch: automated/regenerate-sdk
+          delete-branch: true
+          commit-message: "Regenerate SDK from plexsphere OpenAPI spec"
+          title: "Regenerate ${{ matrix.lang }} SDK from plexsphere OpenAPI spec"
+          body: |
+            Automated regeneration of the `${{ matrix.lang }}` SDK from the
+            plexsphere OpenAPI spec.
+
+            - Generator: ${{ github.server_url }}/${{ github.repository }}@${{ github.sha }}
+            - Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Opened automatically by the `generate` workflow. Review the diff for
+            unexpected or breaking changes before merging.
