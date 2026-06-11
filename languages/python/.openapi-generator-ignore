@@ -2,5 +2,11 @@
 .travis.yml
 git_push.sh
 
+# CI workflows belong to the SDK repo, not the generator. Regenerating them
+# would (a) require `workflow` scope on SDK_PR_TOKEN to push and (b) clobber the
+# SDK repo's own CI gate. Never emit .github/ — the sync (rsync without --delete)
+# leaves the SDK repo's existing .github/ untouched.
+.github/
+
 # Hand-maintained files that must not be overwritten on regeneration:
 README.md
