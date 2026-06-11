@@ -35,10 +35,16 @@ info:
     is not auto-attached by browsers; the sign-in surface
     (`/v1/auth/*`) is exempt because it cannot carry a Principal yet.
   license:
-    # DECISION: Only `name` is set. OpenAPI 3.1 also permits `identifier`
-    # (SPDX), but kin-openapi's validator rejects it as a sibling field,
-    # so we keep the broader-compatible `name`-only form.
+    # DECISION: Both `name` and `identifier` (SPDX) are declared. Per the
+    # OpenAPI 3.1 License Object, `identifier` is mutually exclusive only
+    # with `url` (unset here), so it coexists with `name`. The earlier
+    # `name`-only form was rejected because strict validators
+    # (`openapi-generator validate`) treat a missing
+    # `info.license.identifier` as a hard error; kin-openapi >= 0.136.0
+    # parses the SPDX `identifier` as a first-class 3.1 field, so the
+    # workspace validation gate accepts the pair as well.
     name: BUSL-1.1
+    identifier: BUSL-1.1
 tags:
   - name: meta
     description: Liveness, build-info, and self-description endpoints.
@@ -284,6 +290,15 @@ tags:
       Node Secret Key. The signed token is delivered exactly once, on
       issuance — the list and read projections are metadata-only and never
       re-expose it.
+  # traceability: PX-0082, S057 — operator-facing Secret Store inventory tag.
+  - name: secrets
+    description: |
+      Secret Store inventory — the operator-facing, read-only listing of the
+      secret names and current versions a Project exposes. The projection is
+      metadata-only and never carries a secret value, an OpenBao path, or any
+      wrapping material; the node-facing rewrap proxy that serves the actual
+      ciphertext lives on the `mesh` surface. Every inventory read runs a
+      ReBAC check on the owning Project before any persistence read.
 paths:
   /v1/health:
     get:
@@ -4593,6 +4608,578 @@ paths:
                 detail: "PUT /v1/nodes/{id}/endpoint requires the production wiring of EndpointRecorder, NSKResolver, NodeRepo, and PeerLookup. One or more ports are not yet provisioned in this build."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/endpoint"
                 code: "endpoint_not_provisioned"
+  # traceability: PX-0078, REQ-011, REQ-012, REQ-015
+  /v1/nodes/{id}/secrets/{name}:
+    get:
+      operationId: FetchNodeSecret
+      summary: Fetch a Secret Store entry rewrapped under the calling Node's NSK.
+      # traceability: PX-0078, REQ-011
+      x-plexsphere-no-payload-logging: true
+      description: |
+        Returns the named Secret Store entry for the addressed Node as an
+        AES-256-GCM ciphertext envelope rewrapped under the calling
+        Node's Node Secret Key (NSK). The Secret Store is the platform's
+        only meet-and-rewrap point between the OpenBao backend and the
+        per-Node NSK: the handler reads the OpenBao plaintext, recovers
+        the NSK, and rewraps the payload in-process so that ONLY
+        NSK-wrapped ciphertext ever crosses the wire. The transient
+        OpenBao plaintext and the recovered NSK are zeroed on every exit
+        path; no plaintext is ever persisted, logged, cached, or placed
+        on the event bus.
+
+        The 200 body is the raw envelope `<12-byte nonce> ||
+        <ciphertext + 16-byte GCM tag>`, served as
+        `application/octet-stream`. The caller recovers the seeded
+        plaintext byte-for-byte with `AES-256-GCM-Open` under its NSK.
+        The response carries the served version in
+        `X-Plexsphere-Secret-Version`, the NSK key id used for the wrap
+        in `X-Plexsphere-Secret-KID` (so plexd can pick the right NSK
+        during a rotation overlap), and `Cache-Control: no-store` so no
+        intermediary ever retains the ciphertext.
+
+        The handler:
+
+          1. Authenticates the caller against the Node Secret Key (NSK)
+             plaintext supplied in the `Authorization: Bearer` header,
+             refusing missing or revoked credentials with 401. Only a
+             Node proving possession of its NSK can reach the rewrap
+             pipeline.
+          2. Resolves the addressed secret metadata, applies the
+             per-Node and per-Domain rate limits, and runs the
+             `node-agent` ReBAC visibility check on the addressed Node.
+             An authenticated caller without the relation receives 403
+             `PermissionDenied`; the denial is recorded with
+             `insufficient_relation`.
+          3. Reads the entry from the OpenBao backend — the current
+             version when `version` is omitted, or the requested version
+             when present — reconciling the served version against the
+             metadata; the OpenBao-returned version wins for the header.
+          4. Rewraps the payload under the recovered NSK with a fresh
+             12-byte nonce and emits exactly one granted audit row. A
+             backend read that fails AFTER a granted authorization still
+             records the granted audit row — operational outcomes are
+             carried on the fetch-duration metric, never on the audit
+             chain.
+
+        The response body is capped at 1 MiB of ciphertext.
+
+        DEFERRED-WIRING POSTURE: when the Secret Store backend is not
+        configured (empty backend DSN) the production composition root
+        leaves this surface disabled and every request returns 501 with
+        `code: secrets_not_provisioned` so log scrapers can alert on the
+        deferred-wiring state.
+      tags:
+        - mesh
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Node identifier (UUIDv7) — the secret-fetch scope.
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+            pattern: "^[a-z][a-z0-9_-]{0,62}$"
+          description: |
+            Secret name within the owning Project. Lower-case, starts
+            with a letter, and is limited to letters, digits, hyphen,
+            and underscore (1 to 63 characters).
+        - in: query
+          name: version
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+          description: |
+            Optional OpenBao KV v2 version to fetch. When omitted the
+            current version is served. The version actually served is
+            always reported in the `X-Plexsphere-Secret-Version`
+            response header.
+        - in: header
+          name: Authorization
+          required: true
+          schema:
+            type: string
+          description: |
+            `Bearer <NSK plaintext>` — the per-Node Node Secret Key
+            issued at registration time. Only a Node proving possession
+            of its NSK may fetch a secret; a missing, malformed, or
+            revoked credential surfaces as 401.
+      responses:
+        "200":
+          # traceability: PX-0078, REQ-001, REQ-012, REQ-015
+          x-plexsphere-no-payload-logging: true
+          description: |
+            The rewrapped secret envelope `<12-byte nonce> ||
+            <ciphertext + 16-byte GCM tag>`. `AES-256-GCM-Open` under
+            the calling Node's NSK recovers the seeded cleartext
+            byte-for-byte. The body is opaque ciphertext and is never
+            logged.
+          headers:
+            X-Plexsphere-Secret-Version:
+              description: |
+                The version actually served — the version OpenBao
+                returned, which wins over the metadata current version
+                when KV v2 promoted a version server-side.
+              schema:
+                type: integer
+                minimum: 1
+              required: true
+            X-Plexsphere-Secret-KID:
+              description: |
+                The NSK key id used to wrap the envelope. Lets plexd
+                pick the correct NSK to unwrap with during a key-rotation
+                overlap window.
+              schema:
+                type: string
+              required: true
+            Cache-Control:
+              description: |
+                Always `no-store` — the ciphertext envelope MUST NOT be
+                retained by any intermediary or client cache.
+              schema:
+                type: string
+              required: true
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "401":
+          description: |
+            NSK in the `Authorization: Bearer` header is missing,
+            malformed, or has been revoked. The Problem body's `code`
+            field is `unauthorized`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/unauthorized"
+                title: "Unauthorized"
+                status: 401
+                detail: "NSK presented in Authorization: Bearer is missing or has been revoked."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/secrets/db-password"
+                code: "unauthorized"
+        "403":
+          description: |
+            The NSK authenticates successfully but the calling Node lacks
+            the `node-agent` ReBAC relation that gates visibility of the
+            addressed secret. The PermissionDenied body carries the ReBAC
+            denial `reason` and the `correlation_id` that pairs with the
+            audit entry; surfaced only after authentication so the
+            endpoint cannot be used as a secret-name oracle.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+              example:
+                type: "https://plexsphere.dev/errors/permission-denied"
+                title: "Forbidden"
+                status: 403
+                detail: "calling Node is not permitted to read the addressed secret."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/secrets/db-password"
+                code: "permission_denied"
+                reason: insufficient_relation
+                relation_path: []
+                correlation_id: "01HXYZABCDEFGHJKMNPQRSTVWX"
+        "404":
+          description: |
+            No secret resolves for the addressed Node and name. The
+            Problem body's `code` field disambiguates the cause:
+
+              - `secret_not_found` — no metadata row exists for the
+                addressed Node and name.
+              - `secret_version_not_found` — the requested `version` does
+                not exist at the backend.
+
+            No audit row is emitted for a non-existent secret — nothing
+            was authorized.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/secret-not-found"
+                title: "Not Found"
+                status: 404
+                detail: "no secret named db-password is visible to the addressed Node."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/secrets/db-password"
+                code: "secret_not_found"
+        "429":
+          description: |
+            The per-Node or per-Domain secret-fetch rate-limit bucket is
+            exhausted. The Problem body's `code` field is one of
+            `per_node_rate_limited` or `per_domain_rate_limited`, and the
+            `Retry-After` response header carries the number of seconds
+            the caller should wait before retrying.
+          headers:
+            Retry-After:
+              description: |
+                Seconds the caller should wait before retrying, derived
+                from the exhausted rate-limit bucket's refill window.
+              schema:
+                type: integer
+                minimum: 0
+              required: true
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/per-node-rate-limited"
+                title: "Too Many Requests"
+                status: 429
+                detail: "per-Node secret-fetch rate limit exceeded; retry after the window refills."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/secrets/db-password"
+                code: "per_node_rate_limited"
+        "503":
+          description: |
+            The OpenBao backend is sealed or unavailable, so an
+            authorized read could not be completed. The Problem body's
+            `code` field is `openbao_unavailable`. A backend-unavailable
+            read that follows a granted authorization still emits one
+            granted audit row.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/openbao-unavailable"
+                title: "Service Unavailable"
+                status: 503
+                detail: "the secret backend is sealed or unreachable; the authorized read could not be completed."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/secrets/db-password"
+                code: "openbao_unavailable"
+        "501":
+          description: |
+            The Secret Store surface is not yet provisioned in this
+            build — the backend DSN is unset, so the rewrap pipeline is
+            disabled. The Problem body's `code` field is
+            `secrets_not_provisioned` so log scrapers can alert on the
+            deferred-wiring state. Resolves once the Secret Store backend
+            is configured and the fetch service and its ports are wired
+            into the v1 handler dependency cone.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/secrets-not-provisioned"
+                title: "Not Implemented"
+                status: 501
+                detail: "GET /v1/nodes/{id}/secrets/{name} requires the Secret Store backend to be configured. The surface is not provisioned in this build."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/secrets/db-password"
+                code: "secrets_not_provisioned"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /v1/nodes/{id}/state/reports/{key}:
+    put:
+      operationId: PutNodeStateReport
+      summary: Record an upstream node-state report entry for a Node.
+      # traceability: PX-0080, REQ-005, REQ-006, REQ-007
+      description: |
+        Records one upstream, workload-authored node-state report entry
+        for the addressed Node under the addressed key. The entry is
+        stored with `kind = report`; report entries are Node-authored
+        telemetry and — unlike the platform-owned metadata/data entries —
+        do NOT fan out a `node_state_updated` event.
+
+        The caller authenticates with its Node Secret Key (NSK) in the
+        `Authorization: Bearer` header; the handler asserts the resolved
+        NSK Node matches the path `id` so a Node may only write its own
+        reports. The stored entry surfaces in the `reports` bucket of the
+        `state`/`reports` blocks on the next
+        `GET /v1/nodes/{id}/state` reconciliation pull.
+
+        DEFERRED-WIRING POSTURE: when the node-state service is not wired
+        into this build every request returns 501 with
+        `code: reports_not_provisioned`.
+      tags:
+        - mesh
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Node identifier (UUIDv7) — the report-write scope.
+        - in: path
+          name: key
+          required: true
+          schema:
+            type: string
+            pattern: "^[a-z][a-z0-9._-]{0,127}$"
+          description: |
+            Report entry key. Lower-case, starts with a letter, and is
+            limited to letters, digits, dot, hyphen, and underscore
+            (1 to 128 characters).
+        - in: header
+          name: Authorization
+          required: true
+          schema:
+            type: string
+          description: |
+            `Bearer <NSK plaintext>` — the per-Node Node Secret Key
+            issued at registration time. Only a Node proving possession
+            of its NSK may write a report; a missing, malformed, or
+            revoked credential surfaces as 401.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NodeStateReportRequest"
+      responses:
+        "200":
+          description: |
+            The report entry was accepted and durably recorded. The body
+            echoes the stored key and the server accept timestamp.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeStateReportResponse"
+              example:
+                accepted_at: "2026-06-08T12:00:00Z"
+                key: "cpu-load"
+        "400":
+          description: |
+            The request body is malformed, the key violates the entry
+            grammar, the value exceeds the 4096-byte ceiling, or the
+            per-Node report quota is exhausted. The Problem body's `code`
+            field disambiguates the cause (`invalid_report` or
+            `report_quota_exceeded`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/invalid-report"
+                title: "Bad Request"
+                status: 400
+                detail: "the report value exceeds the 4096-byte limit."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
+                code: "invalid_report"
+        "401":
+          description: |
+            NSK in the `Authorization: Bearer` header is missing,
+            malformed, or has been revoked. The Problem body's `code`
+            field is `unauthorized`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/unauthorized"
+                title: "Unauthorized"
+                status: 401
+                detail: "NSK presented in Authorization: Bearer is missing or has been revoked."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
+                code: "unauthorized"
+        "403":
+          description: |
+            The NSK authenticates but resolves to a different Node than
+            the path `id` — a Node may only write its own reports. The
+            PermissionDenied body's `code` field is `node_id_mismatch`
+            so a leaked NSK cannot be replayed against a sibling Node.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+              example:
+                type: "https://plexsphere.dev/errors/node-id-mismatch"
+                title: "Forbidden"
+                status: 403
+                detail: "resolved NSK Node id does not match URL path id."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
+                code: "node_id_mismatch"
+                reason: insufficient_relation
+                relation_path: []
+                correlation_id: "01HXYZABCDEFGHJKMNPQRSTVWX"
+        "404":
+          description: |
+            No Node resolves for the addressed `id`. The Problem body's
+            `code` field is `node_not_found`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/node-not-found"
+                title: "Not Found"
+                status: 404
+                detail: "node id does not match any Node in this Domain."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
+                code: "node_not_found"
+        "413":
+          description: |
+            The request body exceeds the handler's defensive size cap.
+            The Problem body's `code` field is `payload_too_large`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/payload-too-large"
+                title: "Payload Too Large"
+                status: 413
+                detail: "the request body exceeds the maximum allowed size."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
+                code: "payload_too_large"
+        "501":
+          description: |
+            The node-state service is not yet provisioned in this build.
+            The Problem body's `code` field is `reports_not_provisioned`
+            so log scrapers can alert on the deferred-wiring state.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/reports-not-provisioned"
+                title: "Not Implemented"
+                status: 501
+                detail: "PUT /v1/nodes/{id}/state/reports/{key} requires the production wiring of the node-state service. The surface is not provisioned in this build."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
+                code: "reports_not_provisioned"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+    delete:
+      operationId: DeleteNodeStateReport
+      summary: Delete an upstream node-state report entry for a Node.
+      # traceability: PX-0080, REQ-005, REQ-006
+      description: |
+        Deletes the upstream node-state report entry the addressed Node
+        recorded under the addressed key. Deleting a report emits NO
+        `node_state_updated` event. A delete for a key the Node carries
+        no report under is answered with 404.
+
+        The caller authenticates with its NSK in the `Authorization:
+        Bearer` header; the handler asserts the resolved NSK Node matches
+        the path `id` so a Node may only delete its own reports.
+
+        DEFERRED-WIRING POSTURE: when the node-state service is not wired
+        into this build every request returns 501 with
+        `code: reports_not_provisioned`.
+      tags:
+        - mesh
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Node identifier (UUIDv7) — the report-delete scope.
+        - in: path
+          name: key
+          required: true
+          schema:
+            type: string
+            pattern: "^[a-z][a-z0-9._-]{0,127}$"
+          description: |
+            Report entry key. Lower-case, starts with a letter, and is
+            limited to letters, digits, dot, hyphen, and underscore
+            (1 to 128 characters).
+        - in: header
+          name: Authorization
+          required: true
+          schema:
+            type: string
+          description: |
+            `Bearer <NSK plaintext>` — the per-Node Node Secret Key. Only
+            a Node proving possession of its NSK may delete a report; a
+            missing, malformed, or revoked credential surfaces as 401.
+      responses:
+        "204":
+          description: |
+            The report entry was deleted. No response body.
+        "401":
+          description: |
+            NSK in the `Authorization: Bearer` header is missing,
+            malformed, or has been revoked. The Problem body's `code`
+            field is `unauthorized`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/unauthorized"
+                title: "Unauthorized"
+                status: 401
+                detail: "NSK presented in Authorization: Bearer is missing or has been revoked."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
+                code: "unauthorized"
+        "403":
+          description: |
+            The NSK resolves to a different Node than the path `id` — a
+            Node may only delete its own reports. The PermissionDenied
+            body's `code` field is `node_id_mismatch` so a leaked NSK
+            cannot be replayed against a sibling Node.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+              example:
+                type: "https://plexsphere.dev/errors/node-id-mismatch"
+                title: "Forbidden"
+                status: 403
+                detail: "resolved NSK Node id does not match URL path id."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
+                code: "node_id_mismatch"
+                reason: insufficient_relation
+                relation_path: []
+                correlation_id: "01HXYZABCDEFGHJKMNPQRSTVWX"
+        "404":
+          description: |
+            No report entry exists under the addressed key for the
+            addressed Node (or the Node itself does not resolve). The
+            Problem body's `code` field is `report_not_found`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/report-not-found"
+                title: "Not Found"
+                status: 404
+                detail: "no report entry exists under the addressed key for this Node."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
+                code: "report_not_found"
+        "501":
+          description: |
+            The node-state service is not yet provisioned in this build.
+            The Problem body's `code` field is `reports_not_provisioned`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/reports-not-provisioned"
+                title: "Not Implemented"
+                status: 501
+                detail: "DELETE /v1/nodes/{id}/state/reports/{key} requires the production wiring of the node-state service. The surface is not provisioned in this build."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
+                code: "reports_not_provisioned"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
   /v1/nodes/{id}/capabilities:
     put:
       operationId: PutNodeCapabilities
@@ -5143,6 +5730,906 @@ paths:
                 detail: "POST /v1/nodes/{id}/integrity-violations requires the production wiring of IntegrityViolationsRecorder, NSKResolver, and NodeRepo. One or more ports are not yet provisioned in this build."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/integrity-violations"
                 code: "integrity_violations_not_provisioned"
+  # traceability: PX-0083, REQ-001, REQ-017
+  /v1/nodes/{id}/metrics:
+    post:
+      operationId: PostNodeMetrics
+      summary: Ingest a batch of metric samples for a Node.
+      description: |
+        Accepts a gzip-compressed JSON array of `MetricSample` records
+        pushed by plexd and hands the batch to the per-signal ingest
+        buffer — a JetStream subject keyed by the originating Node's
+        Domain — from which the platform fans out to Grafana Mimir via
+        Prometheus remote-write. Every record is tagged server-side with
+        the Domain and Project of the originating Node so dashboards and
+        alerts scope through the platform label model; the wire body never
+        carries an Identity subject or email (see the de-personalisation
+        note below).
+
+        The handler applies the following gates in order; each maps to a
+        single stable `code` on an RFC 9457 Problem body so generated
+        clients can switch on `code` exhaustively:
+
+          1. Authenticates the caller against the Node Secret Key (NSK)
+             plaintext in the `Authorization: Bearer` header, refusing a
+             missing, malformed, or revoked credential with 401.
+          2. Asserts the NSK belongs to the Node addressed by the path
+             `id`, refusing cross-Node use with 403 `node_id_mismatch` so
+             a leaked NSK cannot be replayed against a sibling Node.
+          3. Refuses a `Content-Encoding` other than `gzip` or `identity`
+             with 415 `ingest_encoding_unsupported`.
+          4. Requires the `X-Plexsphere-Sent-At` header to be present and
+             an RFC 3339 timestamp; a missing or unparseable value is
+             refused with 400 `ingest_sent_at_invalid`. The header drives
+             the ingest-lag metric.
+          5. Caps the compressed wire body; a body over the cap is refused
+             with 413 `ingest_body_too_large` before the gzip reader runs.
+          6. Applies the per-Node then per-Domain byte-weighted quota; an
+             exhausted per-Node bucket surfaces as 429
+             `per_node_rate_limited` and an exhausted per-Domain bucket as
+             429 `capacity_exceeded`, both carrying a `Retry-After` header.
+          7. Inflates the gzip stream under a decompression cap (a stream
+             that fails to inflate is 400 `ingest_encoding_invalid`; an
+             inflated batch over the cap is 413 `ingest_body_too_large`)
+             and structurally validates each record (a malformed record or
+             a `group` outside the closed set is 400
+             `ingest_batch_malformed`; more than the per-batch record cap
+             is 413 `ingest_batch_too_many_records`).
+          8. Publishes the batch to the ingest buffer; a buffer the stream
+             backend cannot accept is 503 `ingest_buffer_unavailable` with
+             a `Retry-After` header.
+
+        On success the handler records the ingest-lag, byte, and record
+        metrics and returns 202 with an `IngestReceipt` carrying the
+        server acceptance timestamp and the accepted record count.
+
+        DE-PERSONALISATION: metric labels carry Domain, Project, Node, and
+        (where relevant) workload identifier — never an Identity subject or
+        email. PII that a record inadvertently carries is the customer's
+        ingest-side responsibility.
+
+        DEFERRED-WIRING POSTURE: when no observability ingest backend is
+        configured (empty `PLEXSPHERE_OBS_NATS_URL`) the production
+        composition root leaves this surface disabled and every request
+        returns 501 with `code: observability_ingest_not_provisioned` so
+        log scrapers can alert on the deferred-wiring state.
+      tags:
+        - mesh
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Node identifier (UUIDv7) — the ingest scope.
+        - in: header
+          name: Authorization
+          required: true
+          schema:
+            type: string
+          description: |
+            `Bearer <NSK plaintext>` — the per-Node Node Secret Key issued
+            at registration time. The NSK is bound to the Node addressed by
+            the path `id`; a credential belonging to a different Node
+            surfaces as 403 `node_id_mismatch`.
+        - in: header
+          name: X-Plexsphere-Sent-At
+          required: false
+          schema:
+            type: string
+            format: date-time
+          # DECISION: the header is declared required:false even though the
+          # handler REQUIRES it. Were it required:true, the generated
+          # oapi-codegen wrapper would reject a missing header with its own
+          # generic 400 before the handler runs, so the refusal could not
+          # carry the stable `ingest_sent_at_invalid` code operators key
+          # alerts off. Declaring it optional lets the request reach the
+          # handler, which enforces presence and RFC 3339 format itself and
+          # emits 400 `ingest_sent_at_invalid`. Reviewer: please verify the
+          # handler-side enforcement matches this contract.
+          # traceability: PX-0083, REQ-009
+          description: |
+            RFC 3339 timestamp at which plexd dispatched the batch. The
+            handler requires it and refuses a missing or unparseable value
+            with 400 `ingest_sent_at_invalid`; it drives the ingest-lag
+            metric the platform records on acceptance.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: "#/components/schemas/MetricSample"
+            example:
+              - group: node_resources
+                name: cpu_seconds_total
+                value: 12345.6
+                labels:
+                  cpu: "0"
+                  mode: user
+                timestamp: "2026-04-27T10:15:30Z"
+      responses:
+        "202":
+          description: |
+            Batch accepted and handed to the ingest buffer. The
+            `IngestReceipt` body carries the server acceptance timestamp
+            and the accepted record count.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestReceipt"
+              example:
+                accepted_at: "2026-04-27T10:15:30.123Z"
+                records: 42
+        "400":
+          description: |
+            The request failed a structural gate. The Problem body's `code`
+            field disambiguates the cause:
+
+              - `ingest_sent_at_invalid` — the `X-Plexsphere-Sent-At`
+                header is missing or not an RFC 3339 timestamp.
+              - `ingest_encoding_invalid` — the gzip stream failed to
+                inflate.
+              - `ingest_batch_malformed` — the decompressed body is not a
+                JSON array, is empty, or a record is missing a required
+                field or carries a `group` outside the closed set.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/ingest-batch-malformed"
+                title: "Bad Request"
+                status: 400
+                detail: "a metric sample is missing a required field or carries a group outside the closed set."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/metrics"
+                code: "ingest_batch_malformed"
+        "401":
+          description: |
+            NSK in the `Authorization: Bearer` header is missing,
+            malformed, or has been revoked. The Problem body's `code` field
+            is `unauthorized` for a missing or malformed credential and
+            `nsk_revoked` for a revoked one, so log scrapers can
+            distinguish credential revocation from a generic auth failure.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/unauthorized"
+                title: "Unauthorized"
+                status: 401
+                detail: "NSK presented in Authorization: Bearer is missing or has been revoked."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/metrics"
+                code: "unauthorized"
+        "403":
+          description: |
+            The NSK authenticates successfully but belongs to a different
+            Node than the path `id`. The PermissionDenied body's `code`
+            field is `node_id_mismatch` so a leaked NSK cannot be replayed
+            against a sibling Node.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+              example:
+                type: "https://plexsphere.dev/errors/node-id-mismatch"
+                title: "Forbidden"
+                status: 403
+                detail: "NSK is bound to a different Node than the path id."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/metrics"
+                code: "node_id_mismatch"
+                reason: insufficient_relation
+                relation_path: []
+                correlation_id: "01HXYZABCDEFGHJKMNPQRSTVWX"
+        "413":
+          description: |
+            The batch exceeded a size cap. The Problem body's `code` field
+            is `ingest_body_too_large` when the compressed wire body or the
+            inflated batch exceeds its byte cap, or
+            `ingest_batch_too_many_records` when the batch carries more
+            records than the per-batch cap.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/ingest-body-too-large"
+                title: "Payload Too Large"
+                status: 413
+                detail: "request body exceeds the observability ingest wire cap."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/metrics"
+                code: "ingest_body_too_large"
+        "415":
+          description: |
+            The `Content-Encoding` header names an encoding other than
+            `gzip` or `identity`. The Problem body's `code` field is
+            `ingest_encoding_unsupported`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/ingest-encoding-unsupported"
+                title: "Unsupported Media Type"
+                status: 415
+                detail: "Content-Encoding must be gzip or identity."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/metrics"
+                code: "ingest_encoding_unsupported"
+        "429":
+          description: |
+            A quota bucket is exhausted. The Problem body's `code` field is
+            `per_node_rate_limited` when the per-Node byte budget is
+            exhausted or `capacity_exceeded` when the per-Domain byte
+            budget is exhausted, and the `Retry-After` response header
+            carries the number of seconds the caller should wait before
+            retrying.
+          headers:
+            Retry-After:
+              description: |
+                Seconds the caller should wait before retrying, derived
+                from the exhausted quota bucket's refill window.
+              schema:
+                type: integer
+                minimum: 0
+              required: true
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/capacity-exceeded"
+                title: "Too Many Requests"
+                status: 429
+                detail: "per-Domain observability ingest budget exceeded; retry after the window refills."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/metrics"
+                code: "capacity_exceeded"
+        "501":
+          description: |
+            The observability ingest surface is not yet provisioned in this
+            build. The Problem body's `code` field is
+            `observability_ingest_not_provisioned` so log scrapers can
+            alert on the deferred-wiring state. Resolves once an
+            observability ingest backend (`PLEXSPHERE_OBS_NATS_URL`) is
+            configured and the ingest Service is wired into the v1 handler
+            dependency cone.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/observability-ingest-not-provisioned"
+                title: "Not Implemented"
+                status: 501
+                detail: "POST /v1/nodes/{id}/metrics requires a configured observability ingest backend. The surface is not provisioned in this build."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/metrics"
+                code: "observability_ingest_not_provisioned"
+        "503":
+          description: |
+            The ingest buffer could not accept the batch — the stream
+            backend is unreachable or saturated. The Problem body's `code`
+            field is `ingest_buffer_unavailable`, and the `Retry-After`
+            response header carries the number of seconds the caller should
+            wait before retrying.
+          headers:
+            Retry-After:
+              description: |
+                Seconds the caller should wait before retrying the batch.
+              schema:
+                type: integer
+                minimum: 0
+              required: true
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/ingest-buffer-unavailable"
+                title: "Service Unavailable"
+                status: 503
+                detail: "the observability ingest buffer is unavailable; retry the batch shortly."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/metrics"
+                code: "ingest_buffer_unavailable"
+  # traceability: PX-0083, REQ-001, REQ-017
+  /v1/nodes/{id}/logs:
+    post:
+      operationId: PostNodeLogs
+      summary: Ingest a batch of structured log lines for a Node.
+      description: |
+        Accepts a gzip-compressed newline-delimited JSON
+        (`application/x-ndjson`) batch of `LogLine` records — one object
+        per line — pushed by plexd and hands the batch to the per-signal
+        ingest buffer (a JetStream subject keyed by the originating Node's
+        Domain), from which the platform routes to Grafana Loki plus
+        optional SIEM forwarding. Every record is tagged server-side with
+        the Domain and Project of the originating Node so dashboards and
+        alerts scope through the platform label model; the wire body never
+        carries an Identity subject or email (see the de-personalisation
+        note below).
+
+        The handler applies the following gates in order; each maps to a
+        single stable `code` on an RFC 9457 Problem body so generated
+        clients can switch on `code` exhaustively:
+
+          1. Authenticates the caller against the Node Secret Key (NSK)
+             plaintext in the `Authorization: Bearer` header, refusing a
+             missing, malformed, or revoked credential with 401.
+          2. Asserts the NSK belongs to the Node addressed by the path
+             `id`, refusing cross-Node use with 403 `node_id_mismatch` so
+             a leaked NSK cannot be replayed against a sibling Node.
+          3. Refuses a `Content-Encoding` other than `gzip` or `identity`
+             with 415 `ingest_encoding_unsupported`.
+          4. Requires the `X-Plexsphere-Sent-At` header to be present and
+             an RFC 3339 timestamp; a missing or unparseable value is
+             refused with 400 `ingest_sent_at_invalid`. The header drives
+             the ingest-lag metric.
+          5. Caps the compressed wire body; a body over the cap is refused
+             with 413 `ingest_body_too_large` before the gzip reader runs.
+          6. Applies the per-Node then per-Domain byte-weighted quota; an
+             exhausted per-Node bucket surfaces as 429
+             `per_node_rate_limited` and an exhausted per-Domain bucket as
+             429 `capacity_exceeded`, both carrying a `Retry-After` header.
+          7. Inflates the gzip stream under a decompression cap (a stream
+             that fails to inflate is 400 `ingest_encoding_invalid`; an
+             inflated batch over the cap is 413 `ingest_body_too_large`)
+             and structurally validates each line (a malformed line or a
+             `severity` outside the closed set is 400
+             `ingest_batch_malformed`; more than the per-batch record cap
+             is 413 `ingest_batch_too_many_records`).
+          8. Publishes the batch to the ingest buffer; a buffer the stream
+             backend cannot accept is 503 `ingest_buffer_unavailable` with
+             a `Retry-After` header.
+
+        On success the handler records the ingest-lag, byte, and record
+        metrics and returns 202 with an `IngestReceipt` carrying the
+        server acceptance timestamp and the accepted record count.
+
+        DE-PERSONALISATION: log labels carry Domain, Project, and Node —
+        never an Identity subject or email. Log lines that inadvertently
+        contain PII are the customer's ingest-side responsibility; an
+        optional per-Domain regex redaction filter, disabled by default,
+        can be enabled at ingest.
+
+        DEFERRED-WIRING POSTURE: when no observability ingest backend is
+        configured (empty `PLEXSPHERE_OBS_NATS_URL`) the production
+        composition root leaves this surface disabled and every request
+        returns 501 with `code: observability_ingest_not_provisioned` so
+        log scrapers can alert on the deferred-wiring state.
+      tags:
+        - mesh
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Node identifier (UUIDv7) — the ingest scope.
+        - in: header
+          name: Authorization
+          required: true
+          schema:
+            type: string
+          description: |
+            `Bearer <NSK plaintext>` — the per-Node Node Secret Key issued
+            at registration time. The NSK is bound to the Node addressed by
+            the path `id`; a credential belonging to a different Node
+            surfaces as 403 `node_id_mismatch`.
+        - in: header
+          name: X-Plexsphere-Sent-At
+          required: false
+          schema:
+            type: string
+            format: date-time
+          # DECISION: the header is declared required:false even though the
+          # handler REQUIRES it. Were it required:true, the generated
+          # oapi-codegen wrapper would reject a missing header with its own
+          # generic 400 before the handler runs, so the refusal could not
+          # carry the stable `ingest_sent_at_invalid` code operators key
+          # alerts off. Declaring it optional lets the request reach the
+          # handler, which enforces presence and RFC 3339 format itself and
+          # emits 400 `ingest_sent_at_invalid`. Reviewer: please verify the
+          # handler-side enforcement matches this contract.
+          # traceability: PX-0083, REQ-009
+          description: |
+            RFC 3339 timestamp at which plexd dispatched the batch. The
+            handler requires it and refuses a missing or unparseable value
+            with 400 `ingest_sent_at_invalid`; it drives the ingest-lag
+            metric the platform records on acceptance.
+      requestBody:
+        required: true
+        # The wire body is newline-delimited JSON: one `LogLine` object per
+        # line, gzip-compressed. The schema documents the per-line record
+        # shape; the array form names the element type without implying the
+        # body is a single JSON array document.
+        content:
+          application/x-ndjson:
+            schema:
+              type: array
+              items:
+                $ref: "#/components/schemas/LogLine"
+      responses:
+        "202":
+          description: |
+            Batch accepted and handed to the ingest buffer. The
+            `IngestReceipt` body carries the server acceptance timestamp
+            and the accepted record count.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestReceipt"
+              example:
+                accepted_at: "2026-04-27T10:15:30.123Z"
+                records: 42
+        "400":
+          description: |
+            The request failed a structural gate. The Problem body's `code`
+            field disambiguates the cause:
+
+              - `ingest_sent_at_invalid` — the `X-Plexsphere-Sent-At`
+                header is missing or not an RFC 3339 timestamp.
+              - `ingest_encoding_invalid` — the gzip stream failed to
+                inflate.
+              - `ingest_batch_malformed` — a line is not a JSON object, the
+                batch is empty, or a line is missing a required field or
+                carries a `severity` outside the closed set.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/ingest-batch-malformed"
+                title: "Bad Request"
+                status: 400
+                detail: "a log line is missing a required field or carries a severity outside the closed set."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/logs"
+                code: "ingest_batch_malformed"
+        "401":
+          description: |
+            NSK in the `Authorization: Bearer` header is missing,
+            malformed, or has been revoked. The Problem body's `code` field
+            is `unauthorized` for a missing or malformed credential and
+            `nsk_revoked` for a revoked one, so log scrapers can
+            distinguish credential revocation from a generic auth failure.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/unauthorized"
+                title: "Unauthorized"
+                status: 401
+                detail: "NSK presented in Authorization: Bearer is missing or has been revoked."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/logs"
+                code: "unauthorized"
+        "403":
+          description: |
+            The NSK authenticates successfully but belongs to a different
+            Node than the path `id`. The PermissionDenied body's `code`
+            field is `node_id_mismatch` so a leaked NSK cannot be replayed
+            against a sibling Node.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+              example:
+                type: "https://plexsphere.dev/errors/node-id-mismatch"
+                title: "Forbidden"
+                status: 403
+                detail: "NSK is bound to a different Node than the path id."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/logs"
+                code: "node_id_mismatch"
+                reason: insufficient_relation
+                relation_path: []
+                correlation_id: "01HXYZABCDEFGHJKMNPQRSTVWX"
+        "413":
+          description: |
+            The batch exceeded a size cap. The Problem body's `code` field
+            is `ingest_body_too_large` when the compressed wire body or the
+            inflated batch exceeds its byte cap, or
+            `ingest_batch_too_many_records` when the batch carries more
+            records than the per-batch cap.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/ingest-body-too-large"
+                title: "Payload Too Large"
+                status: 413
+                detail: "request body exceeds the observability ingest wire cap."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/logs"
+                code: "ingest_body_too_large"
+        "415":
+          description: |
+            The `Content-Encoding` header names an encoding other than
+            `gzip` or `identity`. The Problem body's `code` field is
+            `ingest_encoding_unsupported`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/ingest-encoding-unsupported"
+                title: "Unsupported Media Type"
+                status: 415
+                detail: "Content-Encoding must be gzip or identity."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/logs"
+                code: "ingest_encoding_unsupported"
+        "429":
+          description: |
+            A quota bucket is exhausted. The Problem body's `code` field is
+            `per_node_rate_limited` when the per-Node byte budget is
+            exhausted or `capacity_exceeded` when the per-Domain byte
+            budget is exhausted, and the `Retry-After` response header
+            carries the number of seconds the caller should wait before
+            retrying.
+          headers:
+            Retry-After:
+              description: |
+                Seconds the caller should wait before retrying, derived
+                from the exhausted quota bucket's refill window.
+              schema:
+                type: integer
+                minimum: 0
+              required: true
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/per-node-rate-limited"
+                title: "Too Many Requests"
+                status: 429
+                detail: "per-Node observability ingest budget exceeded; retry after the window refills."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/logs"
+                code: "per_node_rate_limited"
+        "501":
+          description: |
+            The observability ingest surface is not yet provisioned in this
+            build. The Problem body's `code` field is
+            `observability_ingest_not_provisioned` so log scrapers can
+            alert on the deferred-wiring state. Resolves once an
+            observability ingest backend (`PLEXSPHERE_OBS_NATS_URL`) is
+            configured and the ingest Service is wired into the v1 handler
+            dependency cone.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/observability-ingest-not-provisioned"
+                title: "Not Implemented"
+                status: 501
+                detail: "POST /v1/nodes/{id}/logs requires a configured observability ingest backend. The surface is not provisioned in this build."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/logs"
+                code: "observability_ingest_not_provisioned"
+        "503":
+          description: |
+            The ingest buffer could not accept the batch — the stream
+            backend is unreachable or saturated. The Problem body's `code`
+            field is `ingest_buffer_unavailable`, and the `Retry-After`
+            response header carries the number of seconds the caller should
+            wait before retrying.
+          headers:
+            Retry-After:
+              description: |
+                Seconds the caller should wait before retrying the batch.
+              schema:
+                type: integer
+                minimum: 0
+              required: true
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/ingest-buffer-unavailable"
+                title: "Service Unavailable"
+                status: 503
+                detail: "the observability ingest buffer is unavailable; retry the batch shortly."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/logs"
+                code: "ingest_buffer_unavailable"
+  # traceability: PX-0083, REQ-001, REQ-017
+  /v1/nodes/{id}/audit:
+    post:
+      operationId: PostNodeAudit
+      summary: Ingest a batch of normalised audit events for a Node.
+      description: |
+        Accepts a gzip-compressed newline-delimited JSON
+        (`application/x-ndjson`) batch of `AuditEvent` records — one object
+        per line — pushed by plexd and hands the batch to the per-signal
+        ingest buffer (a JetStream subject keyed by the originating Node's
+        Domain), from which the platform routes to Grafana Loki with a
+        separate retention class and a distinct SIEM route. Every record is
+        tagged server-side with the Domain and Project of the originating
+        Node so dashboards and alerts scope through the platform label
+        model; the wire body never carries an Identity subject or email
+        (see the de-personalisation note below).
+
+        The handler applies the following gates in order; each maps to a
+        single stable `code` on an RFC 9457 Problem body so generated
+        clients can switch on `code` exhaustively:
+
+          1. Authenticates the caller against the Node Secret Key (NSK)
+             plaintext in the `Authorization: Bearer` header, refusing a
+             missing, malformed, or revoked credential with 401.
+          2. Asserts the NSK belongs to the Node addressed by the path
+             `id`, refusing cross-Node use with 403 `node_id_mismatch` so
+             a leaked NSK cannot be replayed against a sibling Node.
+          3. Refuses a `Content-Encoding` other than `gzip` or `identity`
+             with 415 `ingest_encoding_unsupported`.
+          4. Requires the `X-Plexsphere-Sent-At` header to be present and
+             an RFC 3339 timestamp; a missing or unparseable value is
+             refused with 400 `ingest_sent_at_invalid`. The header drives
+             the ingest-lag metric.
+          5. Caps the compressed wire body; a body over the cap is refused
+             with 413 `ingest_body_too_large` before the gzip reader runs.
+          6. Applies the per-Node then per-Domain byte-weighted quota; an
+             exhausted per-Node bucket surfaces as 429
+             `per_node_rate_limited` and an exhausted per-Domain bucket as
+             429 `capacity_exceeded`, both carrying a `Retry-After` header.
+          7. Inflates the gzip stream under a decompression cap (a stream
+             that fails to inflate is 400 `ingest_encoding_invalid`; an
+             inflated batch over the cap is 413 `ingest_body_too_large`)
+             and structurally validates each line (a malformed line or a
+             `source` outside the closed set is 400
+             `ingest_batch_malformed`; more than the per-batch record cap
+             is 413 `ingest_batch_too_many_records`).
+          8. Publishes the batch to the ingest buffer; a buffer the stream
+             backend cannot accept is 503 `ingest_buffer_unavailable` with
+             a `Retry-After` header.
+
+        On success the handler records the ingest-lag, byte, and record
+        metrics and returns 202 with an `IngestReceipt` carrying the
+        server acceptance timestamp and the accepted record count.
+
+        DE-PERSONALISATION: audit-ingest labels carry Domain, Project, and
+        Node — never an Identity subject or email. PII that a record
+        inadvertently carries is the customer's ingest-side responsibility.
+
+        DEFERRED-WIRING POSTURE: when no observability ingest backend is
+        configured (empty `PLEXSPHERE_OBS_NATS_URL`) the production
+        composition root leaves this surface disabled and every request
+        returns 501 with `code: observability_ingest_not_provisioned` so
+        log scrapers can alert on the deferred-wiring state.
+      tags:
+        - mesh
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Node identifier (UUIDv7) — the ingest scope.
+        - in: header
+          name: Authorization
+          required: true
+          schema:
+            type: string
+          description: |
+            `Bearer <NSK plaintext>` — the per-Node Node Secret Key issued
+            at registration time. The NSK is bound to the Node addressed by
+            the path `id`; a credential belonging to a different Node
+            surfaces as 403 `node_id_mismatch`.
+        - in: header
+          name: X-Plexsphere-Sent-At
+          required: false
+          schema:
+            type: string
+            format: date-time
+          # DECISION: the header is declared required:false even though the
+          # handler REQUIRES it. Were it required:true, the generated
+          # oapi-codegen wrapper would reject a missing header with its own
+          # generic 400 before the handler runs, so the refusal could not
+          # carry the stable `ingest_sent_at_invalid` code operators key
+          # alerts off. Declaring it optional lets the request reach the
+          # handler, which enforces presence and RFC 3339 format itself and
+          # emits 400 `ingest_sent_at_invalid`. Reviewer: please verify the
+          # handler-side enforcement matches this contract.
+          # traceability: PX-0083, REQ-009
+          description: |
+            RFC 3339 timestamp at which plexd dispatched the batch. The
+            handler requires it and refuses a missing or unparseable value
+            with 400 `ingest_sent_at_invalid`; it drives the ingest-lag
+            metric the platform records on acceptance.
+      requestBody:
+        required: true
+        # The wire body is newline-delimited JSON: one `AuditEvent` object
+        # per line, gzip-compressed. The schema documents the per-line
+        # record shape; the array form names the element type without
+        # implying the body is a single JSON array document.
+        content:
+          application/x-ndjson:
+            schema:
+              type: array
+              items:
+                $ref: "#/components/schemas/AuditEvent"
+      responses:
+        "202":
+          description: |
+            Batch accepted and handed to the ingest buffer. The
+            `IngestReceipt` body carries the server acceptance timestamp
+            and the accepted record count.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestReceipt"
+              example:
+                accepted_at: "2026-04-27T10:15:30.123Z"
+                records: 42
+        "400":
+          description: |
+            The request failed a structural gate. The Problem body's `code`
+            field disambiguates the cause:
+
+              - `ingest_sent_at_invalid` — the `X-Plexsphere-Sent-At`
+                header is missing or not an RFC 3339 timestamp.
+              - `ingest_encoding_invalid` — the gzip stream failed to
+                inflate.
+              - `ingest_batch_malformed` — a line is not a JSON object, the
+                batch is empty, or a line is missing a required field or
+                carries a `source` outside the closed set.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/ingest-batch-malformed"
+                title: "Bad Request"
+                status: 400
+                detail: "an audit event is missing a required field or carries a source outside the closed set."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/audit"
+                code: "ingest_batch_malformed"
+        "401":
+          description: |
+            NSK in the `Authorization: Bearer` header is missing,
+            malformed, or has been revoked. The Problem body's `code` field
+            is `unauthorized` for a missing or malformed credential and
+            `nsk_revoked` for a revoked one, so log scrapers can
+            distinguish credential revocation from a generic auth failure.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/unauthorized"
+                title: "Unauthorized"
+                status: 401
+                detail: "NSK presented in Authorization: Bearer is missing or has been revoked."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/audit"
+                code: "unauthorized"
+        "403":
+          description: |
+            The NSK authenticates successfully but belongs to a different
+            Node than the path `id`. The PermissionDenied body's `code`
+            field is `node_id_mismatch` so a leaked NSK cannot be replayed
+            against a sibling Node.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+              example:
+                type: "https://plexsphere.dev/errors/node-id-mismatch"
+                title: "Forbidden"
+                status: 403
+                detail: "NSK is bound to a different Node than the path id."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/audit"
+                code: "node_id_mismatch"
+                reason: insufficient_relation
+                relation_path: []
+                correlation_id: "01HXYZABCDEFGHJKMNPQRSTVWX"
+        "413":
+          description: |
+            The batch exceeded a size cap. The Problem body's `code` field
+            is `ingest_body_too_large` when the compressed wire body or the
+            inflated batch exceeds its byte cap, or
+            `ingest_batch_too_many_records` when the batch carries more
+            records than the per-batch cap.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/ingest-body-too-large"
+                title: "Payload Too Large"
+                status: 413
+                detail: "request body exceeds the observability ingest wire cap."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/audit"
+                code: "ingest_body_too_large"
+        "415":
+          description: |
+            The `Content-Encoding` header names an encoding other than
+            `gzip` or `identity`. The Problem body's `code` field is
+            `ingest_encoding_unsupported`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/ingest-encoding-unsupported"
+                title: "Unsupported Media Type"
+                status: 415
+                detail: "Content-Encoding must be gzip or identity."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/audit"
+                code: "ingest_encoding_unsupported"
+        "429":
+          description: |
+            A quota bucket is exhausted. The Problem body's `code` field is
+            `per_node_rate_limited` when the per-Node byte budget is
+            exhausted or `capacity_exceeded` when the per-Domain byte
+            budget is exhausted, and the `Retry-After` response header
+            carries the number of seconds the caller should wait before
+            retrying.
+          headers:
+            Retry-After:
+              description: |
+                Seconds the caller should wait before retrying, derived
+                from the exhausted quota bucket's refill window.
+              schema:
+                type: integer
+                minimum: 0
+              required: true
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/capacity-exceeded"
+                title: "Too Many Requests"
+                status: 429
+                detail: "per-Domain observability ingest budget exceeded; retry after the window refills."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/audit"
+                code: "capacity_exceeded"
+        "501":
+          description: |
+            The observability ingest surface is not yet provisioned in this
+            build. The Problem body's `code` field is
+            `observability_ingest_not_provisioned` so log scrapers can
+            alert on the deferred-wiring state. Resolves once an
+            observability ingest backend (`PLEXSPHERE_OBS_NATS_URL`) is
+            configured and the ingest Service is wired into the v1 handler
+            dependency cone.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/observability-ingest-not-provisioned"
+                title: "Not Implemented"
+                status: 501
+                detail: "POST /v1/nodes/{id}/audit requires a configured observability ingest backend. The surface is not provisioned in this build."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/audit"
+                code: "observability_ingest_not_provisioned"
+        "503":
+          description: |
+            The ingest buffer could not accept the batch — the stream
+            backend is unreachable or saturated. The Problem body's `code`
+            field is `ingest_buffer_unavailable`, and the `Retry-After`
+            response header carries the number of seconds the caller should
+            wait before retrying.
+          headers:
+            Retry-After:
+              description: |
+                Seconds the caller should wait before retrying the batch.
+              schema:
+                type: integer
+                minimum: 0
+              required: true
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/ingest-buffer-unavailable"
+                title: "Service Unavailable"
+                status: 503
+                detail: "the observability ingest buffer is unavailable; retry the batch shortly."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/audit"
+                code: "ingest_buffer_unavailable"
   /v1/nodes/{id}/reachability:
     get:
       operationId: GetNodeReachability
@@ -13714,6 +15201,17 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "409":
+          description: |
+            The dispatch targets a hook that failed its trust-on-first-use
+            integrity check — the Node's declared hook digest drifted from the
+            pinned known-good baseline, or no baseline has ever been catalogued
+            for it (the gate fails closed). Body is a `Problem` with
+            `code: hook_integrity_violation`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
         "422":
           description: |
             The dispatch could not be admitted because the resolved target
@@ -14122,6 +15620,119 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+  # traceability: PX-0082, S057, REQ-001 — operator-facing Secret Store inventory.
+  /v1/projects/{project_id}/secrets:
+    get:
+      operationId: ListProjectSecrets
+      summary: List the secret names and current versions a Project exposes.
+      description: |
+        Returns a name-ordered page of Secret Store inventory metadata for
+        the owning Project — each entry carrying ONLY the secret `name` and
+        its `current_version`. The handler runs the secret-read ReBAC check
+        on the Project BEFORE the persistence read. The projection is
+        metadata-only: it never carries a secret payload, an OpenBao path,
+        or any wrapping material, so an operator can audit what a Project
+        exposes without ever seeing a payload.
+
+        The pagination cursor is opaque and HMAC-signed by the server, so a
+        tampered cursor surfaces as `400` on the next call.
+      tags:
+        - secrets
+      security:
+        - operatorBearer: []
+      parameters:
+        - $ref: "#/components/parameters/SecretInventoryProjectID"
+        - in: query
+          name: cursor
+          required: false
+          schema:
+            type: string
+          description: |
+            Opaque continuation token returned by a previous call's
+            `next_cursor`. The encoding is HMAC-signed by the server so a
+            tampered cursor surfaces as `400`.
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: |
+            Maximum number of items to return in a single page. The handler
+            clamps the value to [1, 200] before forwarding it to the read
+            service.
+      responses:
+        "200":
+          description: Page of Secret Store inventory entries.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectSecretList"
+              example:
+                items:
+                  - name: "database-password"
+                    current_version: 3
+                  - name: "tls-private-key"
+                    current_version: 1
+                next_cursor: null
+        "400":
+          description: |
+            Invalid query parameters — typically a tampered or malformed
+            cursor (`code: invalid_cursor`) or an out-of-range `limit`
+            (`code: invalid_limit`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Caller is not authenticated.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            Caller is not authorized to read the secret inventory in the
+            owning Project. Body is a `PermissionDenied` problem.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+        "404":
+          description: |
+            The owning Project does not exist or is not visible. Body is a
+            `Problem` with `code: project_not_found`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: |
+            The secret-inventory surface is not yet provisioned in this
+            build. The Problem body's `code` field is
+            `secrets_inventory_not_provisioned` so log scrapers can alert on
+            the deferred-wiring state. Resolves once the inventory read
+            service and its authz / audit ports are wired into the v1
+            handler dependency cone.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/secrets-inventory-not-provisioned"
+                title: "Not Implemented"
+                status: 501
+                detail: "GET /v1/projects/{project_id}/secrets requires the production wiring of the secret-inventory read service. One or more ports are not yet provisioned in this build."
+                instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1/secrets"
+                code: "secrets_inventory_not_provisioned"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
   /v1/projects/{project_id}/sessions:
     post:
       operationId: IssueSession
@@ -14491,6 +16102,121 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  # traceability: PX-0082, S057, REQ-002 — browser-SSH WebSocket attach gateway.
+  /v1/projects/{project_id}/sessions/{session_id}/attach:
+    get:
+      operationId: AttachSession
+      summary: Attach to a live SSH session as a bidirectional WebSocket stream.
+      description: |
+        Upgrades the request to a WebSocket and bridges the browser to the
+        mediated SSH session identified by `{session_id}` within the owning
+        Project. The handler re-runs the issuance-equivalent ReBAC check on
+        the session's Resource BEFORE dialing anything, validates the Session
+        is `active` and `ssh`-kind, then dials the target plexd
+        `listener_endpoint` over the mesh and copies bytes bidirectionally
+        between the client socket and the mesh connection.
+
+        This operation does NOT speak JSON. On a successful upgrade the
+        response is `101 Switching Protocols` and the connection body is an
+        opaque, bidirectional byte stream carrying the SSH transport — the
+        request and response bodies are NOT JSON documents. The
+        `listener_endpoint` is never written to the client; the browser only
+        ever sees the proxied stream. Error paths (before the upgrade
+        completes) follow the RFC 9457 `application/problem+json` envelope.
+      tags:
+        - access
+      security:
+        - operatorBearer: []
+      parameters:
+        - $ref: "#/components/parameters/SessionProjectID"
+        - $ref: "#/components/parameters/SessionID"
+      responses:
+        "101":
+          description: |
+            Switching Protocols. The connection is upgraded to a WebSocket
+            and the body becomes an opaque, bidirectional byte stream
+            carrying the SSH transport — it is NOT a JSON document. The
+            gateway copies bytes between the client and the mesh connection
+            until either side closes or the request context is cancelled.
+        "401":
+          description: Caller is not authenticated.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            Caller is not authorized to attach to this Session's Resource.
+            Body is a `PermissionDenied` problem; the gateway closes the
+            socket with WebSocket close code `1008` (policy violation) when
+            the denial is detected after the upgrade.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+        "404":
+          description: |
+            The owning Project or the addressed Session does not exist or is
+            not visible. Body is a `Problem` with `code` ∈ {
+            `project_not_found`, `session_not_found` }.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: |
+            The addressed Session cannot be attached. Body is a `Problem`
+            with `code` ∈ { `session_not_active` (the Session is revoked,
+            expired, or otherwise not live), `session_not_ssh` (the Session
+            is `k8s`- or `tcp`-kind — only the `ssh` kind has a browser
+            terminal) }. The gateway rejects with this status BEFORE any
+            mesh dial is attempted.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "426":
+          description: |
+            Upgrade Required. The request did not carry the WebSocket
+            upgrade handshake headers, so the gateway refuses to proceed.
+            Body is a `Problem` with `code: upgrade_required` and the
+            response advertises `Connection: Upgrade` / `Upgrade:
+            websocket`.
+          headers:
+            Upgrade:
+              description: |
+                Advertises the protocol the client must upgrade to
+                (`websocket`).
+              schema:
+                type: string
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: |
+            The access attach gateway is not yet provisioned in this build.
+            The Problem body's `code` field is
+            `access_attach_not_provisioned` so log scrapers can alert on the
+            deferred-wiring state. Resolves once the session-lookup and
+            mesh-dialer ports are wired into the v1 handler dependency cone.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/access-attach-not-provisioned"
+                title: "Not Implemented"
+                status: 501
+                detail: "GET /v1/projects/{project_id}/sessions/{session_id}/attach requires the production wiring of the session-lookup and mesh-dialer ports. One or more ports are not yet provisioned in this build."
+                instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1/sessions/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2/attach"
+                code: "access_attach_not_provisioned"
         "500":
           description: Internal server error.
           content:
@@ -16864,20 +18590,25 @@ components:
             - $ref: "#/components/schemas/NodeStateReports"
           nullable: true
           description: |
-            Node-state reports block — present-but-empty placeholder
-             populates the wire shape. May be `null` until
-            then; the field itself is always present.
+            Node-state block for the addressed Node: its node-state
+            entries fanned into the `metadata`, `data`, and `reports`
+            buckets of `NodeStateReports`. Populated after a successful
+            reconciliation pull — each bucket is `[]` (never `null`) when
+            the Node carries no entry of that kind. The field is always
+            present so plexd's reconcile loop can diff by field presence;
+            it is `null` only when the snapshot carries no node-state
+            projection at all.
         reports:
           allOf:
             - $ref: "#/components/schemas/NodeStateReports"
           nullable: true
           description: |
-            Node-state report aggregates — present-but-empty
-            placeholder populates the wire shape. Mirrors
-            `state` so the convergence with the SSE event taxonomy
-            stays explicit; later stories may collapse one of the
-            two. May be `null` lands; the field itself is
-            always present.
+            Forward-compatibility mirror of `state`: the controller
+            points it at the same `NodeStateReports` value so the
+            convergence with the SSE event taxonomy stays explicit and a
+            future split between live state and rolled-up reports lands
+            without an OpenAPI break. Always equals `state` today. The
+            field is always present and is `null` only when `state` is.
     NodeStatePeer:
       type: object
       description: |
@@ -17288,13 +19019,110 @@ components:
           description: Site-to-site tunnels ordered by slug ascending.
     NodeStateReports:
       type: object
+      # traceability: PX-0080, REQ-001, REQ-002, REQ-003
       description: |
-        Placeholder for the per-Node state/reports block delivered
-        . Carried as a present-but-empty object so the
-        `NodeStateSnapshot` wire shape is stable
-        rollout — adding fields here is a backwards-compatible
-        change.
-      properties: {}
+        Per-Node node-state block carried on the `NodeStateSnapshot`
+        envelope. The addressed Node's node-state entries are fanned
+        into three buckets by kind: operator-visible, platform-owned
+        `metadata`; platform-owned `data`; and upstream,
+        workload-authored `reports`. Each bucket is a required array of
+        `StateEntry` and is `[]` (never `null`) when the Node carries no
+        entry of that kind, so plexd's reconcile loop can diff by field
+        presence. Entries within a bucket are ordered by `key` ascending
+        so two consecutive pulls against the same ledger snapshot are
+        byte-equal.
+      required:
+        - metadata
+        - data
+        - reports
+      properties:
+        metadata:
+          type: array
+          items:
+            $ref: "#/components/schemas/StateEntry"
+          description: |
+            Operator-visible, platform-owned metadata entries for the
+            addressed Node, ordered by `key` ascending.
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/StateEntry"
+          description: |
+            Platform-owned operational data entries for the addressed
+            Node, ordered by `key` ascending.
+        reports:
+          type: array
+          items:
+            $ref: "#/components/schemas/StateEntry"
+          description: |
+            Upstream, workload-authored report entries for the addressed
+            Node, ordered by `key` ascending.
+    StateEntry:
+      type: object
+      # traceability: PX-0080, REQ-001, REQ-002
+      description: |
+        A single node-state entry within a `NodeStateReports` bucket.
+        The triple (`key`, `value`, `workload_tag`) is the minimum plexd
+        needs to correlate a reported entry with the workload that
+        produced it.
+      required:
+        - key
+        - value
+      properties:
+        key:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: The entry's stable identity within its bucket.
+        value:
+          type: string
+          description: The entry's reported value, carried opaquely.
+        workload_tag:
+          type: string
+          description: |
+            Tag of the workload that produced the entry. Absent or empty
+            when the entry is not attributed to a workload.
+    NodeStateReportRequest:
+      type: object
+      # traceability: PX-0080, REQ-005
+      description: |
+        Body for `PUT /v1/nodes/{id}/state/reports/{key}`. Carries the
+        upstream, workload-authored report value the addressed Node is
+        recording for the addressed key.
+      required:
+        - value
+      properties:
+        value:
+          type: string
+          maxLength: 4096
+          description: |
+            The report value to store for the addressed key. Capped at
+            4096 bytes; an over-size value is rejected with 400.
+        workload_tag:
+          type: string
+          description: |
+            Optional tag of the workload producing the report. Stored
+            verbatim and echoed back on the next reconciliation pull.
+    NodeStateReportResponse:
+      type: object
+      # traceability: PX-0080, REQ-005
+      description: |
+        Result of an accepted `PUT /v1/nodes/{id}/state/reports/{key}`.
+        Echoes the stored key and the server wall-clock time at which the
+        report write was accepted.
+      required:
+        - accepted_at
+        - key
+      properties:
+        accepted_at:
+          type: string
+          format: date-time
+          description: |
+            Server wall-clock time at which the report write was
+            accepted and durably recorded.
+        key:
+          type: string
+          description: The report key that was written.
     HeartbeatRequest:
       type: object
       description: |
@@ -17800,6 +19628,242 @@ components:
           description: |
             Number of `IntegrityViolation` rows persisted by this
             request. Matches the `violations` array length on input.
+    MetricSample:
+      type: object
+      description: |
+        A single metric sample in a `POST /v1/nodes/{id}/metrics` batch.
+        The batch body is a JSON array of `MetricSample` objects. Each
+        sample is tagged server-side with the originating Node's Domain
+        and Project — the wire body never carries an identity subject or
+        email — so dashboards and alerts scope through the platform label
+        model rather than through caller-supplied identity. `group`,
+        `name`, `value`, and `timestamp` are required; `labels` is an
+        optional dimension map.
+      required:
+        - group
+        - name
+        - value
+        - timestamp
+      properties:
+        group:
+          type: string
+          enum:
+            - node_resources
+            - tunnel_health
+            - peer_latency
+            - agent_stats
+          # x-enum-varnames pins the generated Go constant names for this
+          # inline enum so oapi-codegen's "prefix only on collision"
+          # heuristic cannot flip the constant form when a sibling enum is
+          # added or removed elsewhere in the document.
+          # traceability: PX-0083, REQ-001
+          x-enum-varnames:
+            - MetricSampleGroupNodeResources
+            - MetricSampleGroupTunnelHealth
+            - MetricSampleGroupPeerLatency
+            - MetricSampleGroupAgentStats
+          description: |
+            The metric group the sample belongs to. The closed set
+            (`node_resources`, `tunnel_health`, `peer_latency`,
+            `agent_stats`) is the roster the ingest parser validates each
+            record against; a value outside the set is rejected with
+            `400 ingest_batch_malformed`.
+        name:
+          type: string
+          description: |
+            The metric name within its group (e.g. `cpu_seconds_total`).
+            Required and non-empty.
+        value:
+          type: number
+          description: |
+            The numeric sample value. Required.
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Optional dimension map carried with the sample. Keys and
+            values are caller-supplied label dimensions; the platform adds
+            the Domain, Project, and Node tags itself and never reads an
+            identity subject or email from this map.
+        timestamp:
+          type: string
+          format: date-time
+          description: |
+            RFC 3339 timestamp at which the sample was observed on the
+            Node. Required.
+      example:
+        group: node_resources
+        name: cpu_seconds_total
+        value: 12345.6
+        labels:
+          cpu: "0"
+          mode: user
+        timestamp: "2026-04-27T10:15:30Z"
+    LogLine:
+      type: object
+      description: |
+        A single structured log line in a `POST /v1/nodes/{id}/logs`
+        batch. The batch body is newline-delimited JSON
+        (`application/x-ndjson`), one `LogLine` object per line. Like every
+        ingest record the line is tagged server-side with the originating
+        Node's Domain and Project and routed to Grafana Loki; the platform
+        never reads an identity subject or email off the line. `severity`,
+        `message`, and `timestamp` are required; `unit` and `hostname` are
+        optional.
+      required:
+        - severity
+        - message
+        - timestamp
+      properties:
+        severity:
+          type: string
+          enum:
+            - emerg
+            - alert
+            - crit
+            - err
+            - warning
+            - notice
+            - info
+            - debug
+          # DECISION: the README ("severity, unit, hostname, and message")
+          # does NOT enumerate the severity values, so the closed set is the
+          # syslog severity keyword roster journald lines map onto — the
+          # exact set the ingest parser validates against (the logSeverities
+          # set in internal/observability/ingest/batch.go, whose DECISION
+          # block requires this OpenAPI schema to mirror it). Alternative
+          # considered: leave severity a free-form string and rely on the
+          # parser alone. REJECTED — the parser already enforces the closed
+          # set, so advertising it on the wire contract keeps generated
+          # clients and the parser in lockstep instead of letting them drift.
+          # x-enum-varnames keeps the generated constant form stable against
+          # the "prefix only on collision" heuristic. Reviewer: please verify
+          # the keyword set against the parser.
+          # traceability: PX-0083, REQ-001
+          x-enum-varnames:
+            - LogLineSeverityEmerg
+            - LogLineSeverityAlert
+            - LogLineSeverityCrit
+            - LogLineSeverityErr
+            - LogLineSeverityWarning
+            - LogLineSeverityNotice
+            - LogLineSeverityInfo
+            - LogLineSeverityDebug
+          description: |
+            Syslog severity keyword of the log line. A value outside the
+            closed set is rejected with `400 ingest_batch_malformed`.
+        unit:
+          type: string
+          description: |
+            Optional originating unit (the systemd unit or file-glob source)
+            the line was collected from.
+        hostname:
+          type: string
+          description: |
+            Optional hostname the line was emitted on.
+        message:
+          type: string
+          description: |
+            The log message body. Required and non-empty. PII that a line
+            inadvertently carries is the customer's ingest-side
+            responsibility; an optional per-Domain redaction filter can be
+            enabled at ingest.
+        timestamp:
+          type: string
+          format: date-time
+          description: |
+            RFC 3339 timestamp at which the line was emitted. Required.
+      example:
+        severity: info
+        unit: plexd.service
+        hostname: edge-node-7
+        message: "tunnel established to peer edge-node-3"
+        timestamp: "2026-04-27T10:15:30Z"
+    AuditEvent:
+      type: object
+      description: |
+        A single normalised audit event in a `POST /v1/nodes/{id}/audit`
+        batch. The batch body is newline-delimited JSON
+        (`application/x-ndjson`), one `AuditEvent` object per line. The
+        closed `source` set mirrors the audit sources the README pins
+        (Linux auditd via AF_AUDIT Netlink, or Kubernetes audit-log
+        tailing). Events are tagged server-side with the originating Node's
+        Domain and Project and routed to Grafana Loki with a separate
+        retention class; the wire body never carries an identity subject or
+        email. `source`, `action`, `outcome`, and `timestamp` are required.
+      required:
+        - source
+        - action
+        - outcome
+        - timestamp
+      properties:
+        source:
+          type: string
+          enum:
+            - auditd
+            - k8s
+          # x-enum-varnames pins the generated Go constant names for this
+          # inline enum so oapi-codegen's "prefix only on collision"
+          # heuristic cannot flip the constant form when a sibling enum is
+          # added or removed elsewhere in the document.
+          # traceability: PX-0083, REQ-001
+          x-enum-varnames:
+            - AuditEventSourceAuditd
+            - AuditEventSourceK8s
+          description: |
+            The audit source the event was normalised from. A value outside
+            the closed set (`auditd`, `k8s`) is rejected with
+            `400 ingest_batch_malformed`.
+        action:
+          type: string
+          description: |
+            The audited action (e.g. the syscall name or Kubernetes verb).
+            Required and non-empty.
+        outcome:
+          type: string
+          description: |
+            The outcome of the audited action (e.g. `success` / `failure`).
+            Required and non-empty.
+        timestamp:
+          type: string
+          format: date-time
+          description: |
+            RFC 3339 timestamp at which the event occurred. Required.
+      example:
+        source: auditd
+        action: execve
+        outcome: success
+        timestamp: "2026-04-27T10:15:30Z"
+    IngestReceipt:
+      type: object
+      description: |
+        Body for the `202 Accepted` response of the three observability
+        ingest operations (`POST /v1/nodes/{id}/metrics`, `.../logs`, and
+        `.../audit`). Carries the server-side acceptance timestamp and the
+        echoed count of records buffered, so the agent can reconcile the
+        batch with its local replay queue. Mirrors the shape of
+        `IntegrityViolationsResponse`.
+      required:
+        - accepted_at
+        - records
+      properties:
+        accepted_at:
+          type: string
+          format: date-time
+          description: |
+            Server-side timestamp at which the batch was accepted and
+            handed to the ingest buffer.
+        records:
+          type: integer
+          minimum: 1
+          description: |
+            Number of records accepted from the batch. Matches the number
+            of array elements (metrics) or non-blank NDJSON lines (logs /
+            audit) on input.
+      example:
+        accepted_at: "2026-04-27T10:15:30.123Z"
+        records: 42
     KeysRotateRequest:
       type: object
       description: |
@@ -18671,6 +20735,15 @@ components:
             Optional free-form description. Empty string when the
             operator did not set one (the wire shape never carries
             `null` for this field).
+        region:
+          type: string
+          pattern: "^[a-z0-9]+(-[a-z0-9]+)*$"
+          maxLength: 64
+          description: |
+            The region the Domain is pinned to. Unlike `description`,
+            this field is OMITTED from the wire entirely when the
+            Domain is unpinned — it is never carried as an empty
+            string, so an absent key means "no region".
         mesh_cidr:
           type: string
           description: |
@@ -18726,6 +20799,16 @@ components:
             Optional free-form description. Whitespace-only strings are
             rejected by the aggregate (the operator most likely fat-
             fingered the field instead of meaning to clear it).
+        region:
+          type: string
+          pattern: "^[a-z0-9]+(-[a-z0-9]+)*$"
+          maxLength: 64
+          description: |
+            Optional region the Domain is pinned to at creation;
+            absent or empty means the Domain is left unpinned. The
+            aggregate's `ParseRegion` enforces the same regex, so
+            surfacing the pattern here lets the generated client
+            validate before the round-trip.
         mesh_cidr:
           type: string
           description: |
@@ -18740,8 +20823,8 @@ components:
       description: |
         Body for `PATCH /v1/domains/{id}`. All
         properties are optional — but the body MUST set at least one
-        of `name`, `description`, `mesh_cidr`, or `reachability`. An
-        empty body is rejected at the handler with
+        of `name`, `description`, `region`, `mesh_cidr`, or
+        `reachability`. An empty body is rejected at the handler with
         `400 empty_patch`.
 
         x-domain-slug-immutable: The `slug` is intentionally absent
@@ -18765,6 +20848,15 @@ components:
             New free-form description. The empty string clears the
             description; a whitespace-only string is rejected so an
             operator typo cannot silently wipe the field.
+        region:
+          type: string
+          pattern: "^[a-z0-9]+(-[a-z0-9]+)*$"
+          maxLength: 64
+          description: |
+            Re-pin the Domain to a region. The aggregate's
+            `ParseRegion` enforces the same regex. Unlike the immutable
+            `slug`, the region is freely re-pinnable through this
+            mutator.
         mesh_cidr:
           type: string
           description: |
@@ -20686,6 +22778,53 @@ components:
           items:
             $ref: "#/components/schemas/Session"
           description: Sessions in the current page.
+        next_cursor:
+          type: string
+          nullable: true
+          description: |
+            Continuation token for the next page. `null` or omitted when
+            the iteration has reached end-of-stream. The encoding is
+            HMAC-signed by the server so a tampered cursor surfaces as
+            `400` on the next call.
+    # traceability: PX-0082, S057, REQ-001 — operator-facing Secret Store inventory projections.
+    ProjectSecretRef:
+      type: object
+      description: |
+        One entry of a Project's Secret Store inventory — the secret `name`
+        and its `current_version`. The projection is metadata-only and NEVER
+        carries a secret payload, an OpenBao path, or any wrapping material.
+      required:
+        - name
+        - current_version
+      properties:
+        name:
+          type: string
+          pattern: "^[a-z][a-z0-9_-]{0,62}$"
+          description: |
+            Secret name within the owning Project. Lower-case, starts with a
+            letter, and is limited to letters, digits, hyphen, and underscore
+            (1 to 63 characters).
+        current_version:
+          type: integer
+          format: int32
+          minimum: 1
+          description: |
+            The currently-served KV v2 version of the secret — a small,
+            monotonically-increasing integer that starts at 1.
+    ProjectSecretList:
+      type: object
+      description: |
+        Page of Secret Store inventory entries returned by
+        `GET /v1/projects/{project_id}/secrets`. The window is computed by
+        the persistence layer in ascending name order.
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProjectSecretRef"
+          description: Secret inventory entries in the current page.
         next_cursor:
           type: string
           nullable: true
@@ -23912,8 +26051,21 @@ components:
         format: uuid
       description: |
         Session identifier (UUIDv7). Bound on
-        `/v1/projects/{project_id}/sessions/{session_id}` and its
-        `:revoke` sub-resource for the single-Session read and revoke.
+        `/v1/projects/{project_id}/sessions/{session_id}`, its `:revoke`
+        sub-resource, and its `/attach` WebSocket gateway for the
+        single-Session read, revoke, and attach.
+    # traceability: PX-0082, S057, REQ-001 — Secret Store inventory path parameter.
+    SecretInventoryProjectID:
+      in: path
+      name: project_id
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: |
+        Owning Project. The operator-facing Secret Store inventory is scoped
+        per Project, so the listing endpoint requires the Project identifier
+        in the path.
     BootstrapTokenProjectID:
       in: path
       name: project_id
