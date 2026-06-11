@@ -1,22 +1,22 @@
 {{>partial_header}}
 {{!
-  OVERRIDE of the stock `go` generator template (openapi-generator 7.22.0).
+  Vendored from openapi-generator 7.22.0 go/api.mustache. Sole change vs
+  upstream: the two operation doc comments below render the escaped notes
+  variable instead of the raw, unescaped one. The doc comments are Go block
+  comments (slash-star ... star-slash); an operation description containing that
+  terminator would close the comment early and leak the rest into the file as
+  invalid Go. The escaped variable is routed through escapeText(), whose Go
+  override rewrites the terminator to a harmless form, matching how the model
+  templates already render descriptions.
 
-  Only change vs upstream: the two operation doc comments render `{{{notes}}}`
-  instead of `{{{unescapedNotes}}}` (lines ~24 and ~85).
-
-  Why: the doc comments are Go block comments (slash-star ... star-slash). The
-  raw `unescapedNotes` is the operation description verbatim, so a description
-  containing the comment terminator (e.g. the Accept wildcard star-slash-star in
-  the spec) closes the block comment early and the rest of the text leaks into
-  the file as invalid Go. `notes` is the same description routed through
-  escapeText(), whose Go override escapeUnsafeCharacters() rewrites the
-  terminator to a harmless form — matching how the model_* templates already
-  render descriptions. This keeps the generated SDK compiling regardless of what
-  punctuation upstream puts in descriptions.
+  IMPORTANT: never write a double-brace, a triple-brace variable, or a backtick
+  inside THIS comment. A Mustache comment ends at its first double-brace, so any
+  of those would terminate it early and dump the rest of this prose into every
+  generated .go file -- which was the exact bug this wording replaced.
 
   On a generator bump: re-extract go/api.mustache from the new jar and re-apply
-  this single substitution, or drop this file if upstream switches to `notes`.
+  the two escaped-notes substitutions. Rationale also in
+  languages/go/openapi-generator-config.yaml.
 }}
 package {{packageName}}
 

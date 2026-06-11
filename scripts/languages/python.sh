@@ -9,7 +9,6 @@ generate_sdk() {
     -g python \
     -o "$OUT" \
     -c "$CONFIG" \
-    --ignore-file-override languages/python/.openapi-generator-ignore \
     --package-name plexsphere \
     --http-user-agent "plexsphere-sdk-python"
 

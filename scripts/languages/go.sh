@@ -12,7 +12,6 @@ generate_sdk() {
     -g go \
     -o "$OUT" \
     -c "$CONFIG" \
-    --ignore-file-override languages/go/.openapi-generator-ignore \
     --package-name plexsphere \
     --git-host github.com \
     --git-user-id plexsphere \

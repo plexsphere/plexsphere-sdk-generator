@@ -46,4 +46,22 @@ echo ">> Generating ${LANGUAGE} SDK into ${OUT_DIR}"
 source "$LANG_SCRIPT"
 generate_sdk "$JAR" "$SPEC_FILE" "$OUT_DIR"
 
+# Drop files the SDK repo owns or does not want before the tree is overlaid
+# (rsync without --delete) onto the SDK repo. The set is declared in
+# languages/<lang>/.openapi-generator-ignore and enforced here, NOT via
+# openapi-generator's --ignore-file-override: that flag matches patterns
+# relative to the ignore file's own directory, so an out-of-tree override never
+# matched and the generator shipped .github/ (rejected without `workflow` scope
+# on SDK_PR_TOKEN), README.md and the helper scaffolding regardless.
+IGNORE_FILE="languages/${LANGUAGE}/.openapi-generator-ignore"
+if [ -f "$IGNORE_FILE" ]; then
+  while IFS= read -r pattern || [ -n "$pattern" ]; do
+    case "$pattern" in
+      '' | '#'*) continue ;;   # skip blank lines and comments
+    esac
+    echo ">> Pruning generated ${pattern%/}"
+    rm -rf "${OUT_DIR:?}/${pattern%/}"
+  done < "$IGNORE_FILE"
+fi
+
 echo ">> Done: ${OUT_DIR}"

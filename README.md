@@ -667,17 +667,27 @@ additionalProperties:
 
 #### `.openapi-generator-ignore` (per language)
 
-Controls which generated files are **not** overwritten (syntax like `.gitignore`). Useful to
-protect a hand-maintained README or a CSRF extension. Minimal:
+Declares which generated paths are **dropped** from `dist/<lang>/` before the overlay, so the
+SDK repo's own copy survives the `rsync` (which runs without `--delete`). Useful to protect a
+hand-maintained README, the SDK repo's CI under `.github/`, or a CSRF extension. Minimal:
 
 ```gitignore
 # Generated notice/helper files we don't want:
 .travis.yml
 git_push.sh
 
-# Add your own hand-maintained files here so they aren't overwritten:
-# README.md
+# CI workflows and hand-maintained files the SDK repo owns:
+.github/
+README.md
 ```
+
+> **Enforcement.** `scripts/generate-sdk.sh` reads this file and `rm -rf`s each listed path
+> (one path per line; `#` comments and blank lines ignored; a trailing `/` is stripped) after
+> generation. We do **not** pass openapi-generator's `--ignore-file-override`: it matches
+> patterns relative to the ignore file's *own* directory, so an out-of-tree override never
+> matches and the generator ships `.github/` (rejected without `workflow` scope on the PR
+> token), `README.md`, etc. regardless. Keep entries to literal paths — full `.gitignore` glob
+> syntax is not interpreted.
 
 ---
 
