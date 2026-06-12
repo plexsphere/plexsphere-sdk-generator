@@ -256,7 +256,10 @@ SPEC_URL        ?= https://api.plexsphere.com/plexsphere-v1.yaml
 SPEC_FILE       ?= spec/plexsphere-v1.yaml
 SPEC_LOCK       ?= spec/spec-lock.json
 
-# Pinned generator version (>=7.x because of OpenAPI 3.1!)
+# Pinned generator version (>=7.x because of OpenAPI 3.1!). Renovate keeps it
+# current via the annotation below, which tracks the Maven artifact that
+# scripts/_fetch_jar.sh downloads (see renovate.json).
+# renovate: datasource=maven depName=org.openapitools:openapi-generator-cli
 GENERATOR_VERSION ?= 7.22.0
 
 LANGUAGES       := go python typescript
@@ -852,8 +855,10 @@ repo (separate from the license of *this* generator repo).
 
 Two things must be pinned for builds to be reproducible:
 
-1. **Generator version** — in the `Makefile` (`GENERATOR_VERSION`) or `openapitools.json`.
-   Renovate can update it automatically (a comment annotation like STACKIT's).
+1. **Generator version** — `GENERATOR_VERSION` in the [`Makefile`](Makefile), kept current by
+   Renovate via a `datasource=maven` annotation (see [Renovate](#renovate) below). The
+   npm-wrapper variant pins the same version in `openapitools.json` instead; this repo uses
+   the Makefile.
 2. **Spec state** — `spec/plexsphere-v1.yaml` is committed, and `spec/spec-lock.json` records
    the source, `sha256`, API version, and fetch time. `make download-spec` rewrites the lock
    from the spec, so the two cannot silently drift.
@@ -869,6 +874,16 @@ Keeping the vendored spec *current* with upstream is the separate job of
 [`update-spec.yaml`](.github/workflows/update-spec.yaml), which re-runs `make download-spec`
 on a schedule and opens a PR when upstream changed. Drift from upstream therefore surfaces as
 a reviewable PR, not as a red build on otherwise-unrelated PRs.
+
+### Renovate
+
+[`renovate.json`](renovate.json) extends `config:recommended` and adds a custom manager that
+reads the `# renovate: datasource=maven depName=org.openapitools:openapi-generator-cli`
+annotation above `GENERATOR_VERSION` in the [`Makefile`](Makefile). Renovate then opens a PR
+whenever a newer OpenAPI Generator is published to Maven Central — the same artifact
+[`scripts/_fetch_jar.sh`](scripts/_fetch_jar.sh) downloads. `config:recommended` also keeps the
+SHA-pinned GitHub Actions current. Re-check the per-language templates after a generator bump:
+7.x minor releases occasionally change generated output.
 
 SDK versioning: SemVer per SDK, driven by the spec's `info.version` plus an own patch level.
 On breaking spec changes → major bump of the SDK.
