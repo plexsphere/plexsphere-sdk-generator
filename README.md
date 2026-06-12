@@ -885,8 +885,23 @@ whenever a newer OpenAPI Generator is published to Maven Central — the same ar
 SHA-pinned GitHub Actions current. Re-check the per-language templates after a generator bump:
 7.x minor releases occasionally change generated output.
 
-SDK versioning: SemVer per SDK, driven by the spec's `info.version` plus an own patch level.
-On breaking spec changes → major bump of the SDK.
+### SDK SemVer policy
+
+Each SDK (`plexsphere-sdk-go`, `plexsphere-sdk-python`) is released with
+[SemVer](https://semver.org) `MAJOR.MINOR.PATCH`, driven by the spec's `info.version` plus the
+SDK's own patch level:
+
+- **MAJOR** — a breaking spec change (a removed or renamed endpoint, field, or enum value; a
+  narrowed type; a new required request field) **or** a bump of the spec's `info.version`
+  (currently `v1`). Generated code that breaks a caller's build is a major bump.
+- **MINOR** — a backward-compatible spec addition (a new endpoint, optional field, or enum
+  value) that grows the SDK surface without breaking callers.
+- **PATCH** — no spec change: a generator upgrade, template fix, or post-processing change that
+  leaves the public SDK surface compatible.
+
+The spec's `info.version` (`v1`) communicates the API contract version; each SDK's SemVer is
+its own, but a change to `info.version` always forces a major bump. Each SDK repo owns its tag
+and release — this generator only produces the code.
 
 ---
 
