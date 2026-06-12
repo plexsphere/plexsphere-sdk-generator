@@ -3,7 +3,10 @@ SPEC_URL        ?= https://api.plexsphere.com/plexsphere-v1.yaml
 SPEC_FILE       ?= spec/plexsphere-v1.yaml
 SPEC_LOCK       ?= spec/spec-lock.json
 
-# Pinned generator version (>=7.x because of OpenAPI 3.1!)
+# Pinned generator version (>=7.x because of OpenAPI 3.1!). Renovate keeps it
+# current via the annotation below, which tracks the Maven artifact that
+# scripts/_fetch_jar.sh downloads (see renovate.json).
+# renovate: datasource=maven depName=org.openapitools:openapi-generator-cli
 GENERATOR_VERSION ?= 7.22.0
 
 LANGUAGES       := go python
