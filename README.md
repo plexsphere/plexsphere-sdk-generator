@@ -264,7 +264,7 @@ LANGUAGES       := go python typescript
 .DEFAULT_GOAL := help
 
 # Targets ------------------------------------------------------------------
-.PHONY: help download-spec validate-spec generate-all $(addprefix generate-,$(LANGUAGES))
+.PHONY: help download-spec validate-spec check-spec-lock generate-all $(addprefix generate-,$(LANGUAGES))
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -277,6 +277,10 @@ download-spec: ## Download the OpenAPI spec and pin it (sha256) in spec/spec-loc
 validate-spec: ## Validate the vendored spec
 	@SPEC_FILE="$(SPEC_FILE)" GENERATOR_VERSION="$(GENERATOR_VERSION)" \
 	  scripts/validate-spec.sh
+
+check-spec-lock: ## Check the vendored spec matches spec/spec-lock.json (sha256)
+	@SPEC_FILE="$(SPEC_FILE)" SPEC_LOCK="$(SPEC_LOCK)" \
+	  scripts/check-spec-lock.sh
 
 generate-all: $(addprefix generate-,$(LANGUAGES)) ## Generate all SDKs
 
@@ -851,8 +855,20 @@ Two things must be pinned for builds to be reproducible:
 1. **Generator version** — in the `Makefile` (`GENERATOR_VERSION`) or `openapitools.json`.
    Renovate can update it automatically (a comment annotation like STACKIT's).
 2. **Spec state** — `spec/plexsphere-v1.yaml` is committed, and `spec/spec-lock.json` records
-   the source, `sha256`, and fetch time. CI can enforce that `download-spec` produces no diff
-   (= spec is current) and that the hash matches the lock (= unchanged).
+   the source, `sha256`, API version, and fetch time. `make download-spec` rewrites the lock
+   from the spec, so the two cannot silently drift.
+
+### Lock-hash CI gate
+
+`make check-spec-lock` recomputes the vendored spec's SHA-256 and asserts it equals the
+`sha256` in `spec/spec-lock.json`. It is **offline and deterministic** — no network, no Java —
+so [`validate.yaml`](.github/workflows/validate.yaml) runs it on every PR and a hand-edited
+spec or a stale lock **fails the build**. This is the "spec unchanged" half of reproducibility.
+
+Keeping the vendored spec *current* with upstream is the separate job of
+[`update-spec.yaml`](.github/workflows/update-spec.yaml), which re-runs `make download-spec`
+on a schedule and opens a PR when upstream changed. Drift from upstream therefore surfaces as
+a reviewable PR, not as a red build on otherwise-unrelated PRs.
 
 SDK versioning: SemVer per SDK, driven by the spec's `info.version` plus an own patch level.
 On breaking spec changes → major bump of the SDK.
@@ -874,9 +890,10 @@ reviewed and merged. `validate.yaml` gates spec PRs opened by hand.
 
 ### `validate.yaml` — PR gate
 
-On every PR: set up Java → `make download-spec` (or use the vendored spec) →
-`make validate-spec`. Optionally a diff check that the vendored spec matches the hash in the
-lock.
+On every PR: `make check-spec-lock` (the vendored spec must match the `sha256` in the lock —
+see [Lock-hash CI gate](#lock-hash-ci-gate)) → set up Java → `make validate-spec`. The lock
+check runs first because it is offline and deterministic; a drifted spec fails the PR before
+the generator jar is even fetched.
 
 ```yaml
 name: validate
@@ -889,6 +906,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: make check-spec-lock   # spec sha256 must match spec/spec-lock.json
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

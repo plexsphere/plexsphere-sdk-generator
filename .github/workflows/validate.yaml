@@ -15,6 +15,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Reproducibility gate: the vendored spec must match the sha256 pinned in
+      # spec/spec-lock.json, so a hand-edited spec or a stale lock fails the PR.
+      # Offline and deterministic (no network, no Java), so it runs first and
+      # never flakes on upstream drift (see README §"Versioning & reproducibility").
+      - run: make check-spec-lock
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

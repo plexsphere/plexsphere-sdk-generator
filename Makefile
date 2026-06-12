@@ -14,7 +14,7 @@ LANGUAGES       := go python
 # Note: generate-<lang> targets are intentionally NOT marked .PHONY — GNU Make
 # skips implicit/pattern-rule search for .PHONY targets, which would stop the
 # generate-% rule below from matching them (e.g. `make generate-go`).
-.PHONY: help download-spec validate-spec generate-all
+.PHONY: help download-spec validate-spec check-spec-lock generate-all
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -27,6 +27,10 @@ download-spec: ## Download the OpenAPI spec and pin it (sha256) in spec/spec-loc
 validate-spec: ## Validate the vendored spec
 	@SPEC_FILE="$(SPEC_FILE)" GENERATOR_VERSION="$(GENERATOR_VERSION)" \
 	  scripts/validate-spec.sh
+
+check-spec-lock: ## Check the vendored spec matches spec/spec-lock.json (sha256)
+	@SPEC_FILE="$(SPEC_FILE)" SPEC_LOCK="$(SPEC_LOCK)" \
+	  scripts/check-spec-lock.sh
 
 generate-all: $(addprefix generate-,$(LANGUAGES)) ## Generate all SDKs
 
