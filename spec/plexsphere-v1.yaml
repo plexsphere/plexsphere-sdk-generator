@@ -299,6 +299,16 @@ tags:
       wrapping material; the node-facing rewrap proxy that serves the actual
       ciphertext lives on the `mesh` surface. Every inventory read runs a
       ReBAC check on the owning Project before any persistence read.
+  # traceability: PX-0089, S064 — per-Domain capacity-and-scale snapshot tag.
+  - name: capacity
+    description: |
+      Capacity & scale — the operator-facing, read-only per-Domain snapshot
+      of `used / target` headroom for each catalogued capacity dimension
+      (nodes, SSE fan-out, secret reads, mediated sessions, observability
+      ingest, action executions). The platform collector samples usage on a
+      fixed interval; this surface exposes the latest snapshot for the
+      Dashboard capacity view. Every read runs a `domain-view` ReBAC check on
+      the addressed Domain before the snapshot is read.
 paths:
   /v1/health:
     get:
@@ -12424,6 +12434,749 @@ paths:
                 detail: "GET /v1/domains/{domainId}/mesh/topology requires the production wiring of TopologyProjection and RelationChecker. One or more ports are not yet provisioned in this build."
                 instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/mesh/topology"
                 code: mesh_topology_not_provisioned
+  /v1/domains/{domainId}/capacity:
+    get:
+      operationId: GetDomainCapacity
+      summary: Return the capacity-and-scale snapshot for a Domain.
+      description: |
+        Returns the latest per-Domain capacity snapshot the platform
+        collector samples on a fixed interval: one `used / target` reading
+        for each of the six catalogued capacity dimensions (`nodes`,
+        `sse_fanout`, `secret_reads`, `mediated_sessions`,
+        `observability_ingest`, `action_executions`). The Dashboard capacity
+        view and operators reading scale headroom consume this pull.
+
+        The handler:
+
+          1. Authenticates the caller and rejects requests without a
+             resolved Principal with 401.
+          2. Checks the `domain-view` ReBAC relation on the addressed Domain
+             BEFORE reading the snapshot so the endpoint cannot be used as a
+             Domain-id oracle; an unauthorised caller receives 403.
+          3. Returns the snapshot with 200 once the collector has sampled at
+             least once. Before the first sample completes the snapshot is
+             unavailable and the handler returns 503
+             `capacity_snapshot_unavailable` with a `Retry-After` header.
+
+        DEFERRED-WIRING POSTURE: until the production composition root
+        supplies the collector-backed snapshot provider and the ReBAC
+        RelationChecker, every request returns 501 so log scrapers can alert
+        on the deferred-wiring state.
+      tags:
+        - capacity
+      parameters:
+        - $ref: "#/components/parameters/AuditDomainID"
+      responses:
+        "200":
+          description: |
+            Capacity snapshot for the addressed Domain.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DomainCapacitySnapshot"
+              example:
+                sampled_at: "2026-05-25T10:00:00Z"
+                dimensions:
+                  - dimension: nodes
+                    unit: count
+                    used: 8200
+                    target: 10000
+                    ratio: 0.82
+                  - dimension: sse_fanout
+                    unit: events_per_second
+                    used: 540
+                    target: 1000
+                    ratio: 0.54
+                  - dimension: secret_reads
+                    unit: reads_per_second
+                    used: 3100
+                    target: 10000
+                    ratio: 0.31
+                  - dimension: mediated_sessions
+                    unit: count
+                    used: 120
+                    target: 500
+                    ratio: 0.24
+                  - dimension: observability_ingest
+                    unit: bytes_per_second
+                    used: 2097152
+                    target: 5242880
+                    ratio: 0.4
+                  - dimension: action_executions
+                    unit: count
+                    used: 60
+                    target: 1000
+                    ratio: 0.06
+        "400":
+          description: |
+            The path `{domainId}` was not a non-zero UUID. The Problem body's
+            `code` field is `invalid_domain_id`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Caller is not authenticated.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            Caller lacks the `domain-view` ReBAC relation on the addressed
+            Domain. Surfaced before the snapshot read so the endpoint cannot
+            be used as a Domain-id oracle.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+        "500":
+          description: |
+            Internal server error: a snapshot-read fault or an
+            authorization-check fault surfaces here.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: |
+            The capacity snapshot surface is not yet provisioned in this
+            build, so log scrapers can alert on the deferred-wiring state.
+            Resolves once the collector-backed snapshot provider and the
+            ReBAC RelationChecker are wired into the v1 handler dependency
+            cone.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: |
+            The collector has not produced a snapshot for the Domain yet
+            (no sample has completed since boot). The Problem body's `code`
+            field is `capacity_snapshot_unavailable`, and the `Retry-After`
+            response header carries the number of seconds the caller should
+            wait before retrying.
+          headers:
+            Retry-After:
+              description: |
+                Seconds the caller should wait before retrying, derived from
+                the collector's sample interval.
+              schema:
+                type: integer
+                minimum: 0
+              required: true
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/capacity-snapshot-unavailable"
+                title: "Service Unavailable"
+                status: 503
+                detail: "the capacity collector has not produced a snapshot for this Domain yet; retry after the next sample."
+                instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/capacity"
+                code: "capacity_snapshot_unavailable"
+  # traceability: PX-0090, S065 — opt-in PlexdHook managed-push surface.
+  # DECISION: the rollback sub-resource is modelled as a `:rollback`
+  # colon-verb POST rather than a separate `/rollback` path segment or a
+  # PATCH on the push resource. The alternative (a PATCH that mutates a
+  # `status` field) was rejected because rollback is a side-effecting cluster
+  # operation, not an idempotent field write, and the colon-verb mirrors the
+  # established `/v1/projects/{project_id}/executions:dispatch` idiom so the
+  # action verb reads as a verb, not a resource (PX-0090, REQ-001).
+  /v1/domains/{domainId}/managed-push:
+    get:
+      operationId: GetManagedPush
+      summary: Read the managed-push target configured for a Domain.
+      description: |
+        Returns the read projection of the opt-in managed-push target a
+        Domain operator attached for the Domain — the cluster the platform
+        applies PlexdHook objects to on the operator's behalf. The
+        projection is display-only: it carries the target's enabled flag,
+        the API-server URL, a hex SHA-256 fingerprint of the kubeconfig
+        plaintext, and the create/update timestamps. It NEVER carries the
+        kubeconfig ciphertext or plaintext — the plaintext is sealed at
+        rest and never echoed back over the API.
+
+        The handler:
+
+          1. Authenticates the caller and rejects requests without a
+             resolved Principal with 401.
+          2. Checks the managed-push read ReBAC relation on the addressed
+             Domain BEFORE reading the target so the endpoint cannot be
+             used as a Domain-id oracle; an unauthorised caller receives
+             403.
+          3. Returns the target projection with 200 when a target is
+             configured, or 404 `managed_push_not_configured` when the
+             Domain has no managed-push target.
+
+        DEFERRED-WIRING POSTURE: until the production composition root
+        supplies the managed-push service bundle, every request returns 501
+        so log scrapers can alert on the deferred-wiring state.
+      tags:
+        - hooks
+      parameters:
+        - $ref: "#/components/parameters/AuditDomainID"
+      responses:
+        "200":
+          description: |
+            Managed-push target projection for the addressed Domain.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedPushTarget"
+              example:
+                enabled: true
+                api_server_url: "https://cluster.example.internal:6443"
+                kubeconfig_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                created_at: "2026-06-01T10:00:00Z"
+                updated_at: "2026-06-01T10:00:00Z"
+        "400":
+          description: |
+            The path `{domainId}` was not a non-zero UUID. The Problem
+            body's `code` field is `invalid_domain_id`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Caller is not authenticated.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            Caller lacks the managed-push read ReBAC relation on the
+            addressed Domain. Surfaced before the target read so the
+            endpoint cannot be used as a Domain-id oracle.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+        "404":
+          description: |
+            The Domain has no managed-push target configured. The Problem
+            body's `code` field is `managed_push_not_configured`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: |
+            The managed-push surface is not yet provisioned in this build,
+            so log scrapers can alert on the deferred-wiring state. Resolves
+            once the managed-push service bundle is wired into the v1
+            handler dependency cone.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+    put:
+      operationId: PutManagedPush
+      summary: Attach or replace a Domain's managed-push target.
+      description: |
+        Attaches the opt-in managed-push target for a Domain, or replaces
+        the existing target's kubeconfig and enabled flag. The request
+        carries a base64-encoded kubeconfig and the enabled flag; the
+        plaintext is validated, sealed at rest, and NEVER echoed back —
+        the 200 response is the display-only target projection.
+
+        The handler:
+
+          1. Authenticates the caller and rejects requests without a
+             resolved Principal with 401.
+          2. Checks the managed-push write ReBAC relation on the addressed
+             Domain BEFORE any persistence write; an unauthorised caller
+             receives 403.
+          3. Decodes and validates the kubeconfig. Only embedded, in-band
+             credentials are accepted: a token, or `client-certificate-data`
+             / `client-key-data`, with the CA supplied as
+             `certificate-authority-data`. An oversized payload is rejected
+             with 413 `kubeconfig_too_large`; a kubeconfig that fails
+             validation is rejected with 422 `kubeconfig_invalid`. Validation
+             rejects an `exec` or `auth-provider` credential plugin, any
+             file-path credential (`tokenFile`, `client-certificate`,
+             `client-key`), a `certificate-authority` file path, a
+             `proxy-url`, a non-https server, and `insecure-skip-tls-verify`
+             — the control plane never reads operator-named local files nor
+             dials an operator-supplied proxy.
+          4. Seals the plaintext and persists the target, returning the
+             display-only projection with 200.
+
+        DEFERRED-WIRING POSTURE: until the production composition root
+        supplies the managed-push service bundle, every request returns 501.
+      tags:
+        - hooks
+      parameters:
+        - $ref: "#/components/parameters/AuditDomainID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagedPushAttachRequest"
+            example:
+              kubeconfig_b64: "YXBpVmVyc2lvbjogdjEKa2luZDogQ29uZmlnCg=="
+              enabled: true
+      responses:
+        "200":
+          description: |
+            Managed-push target attached or replaced. Body is the
+            display-only target projection; the kubeconfig plaintext is
+            never echoed back.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedPushTarget"
+              example:
+                enabled: true
+                api_server_url: "https://cluster.example.internal:6443"
+                kubeconfig_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                created_at: "2026-06-01T10:00:00Z"
+                updated_at: "2026-06-01T10:00:00Z"
+        "400":
+          description: |
+            The path `{domainId}` was not a non-zero UUID, or the request
+            body was malformed. The Problem body's `code` field is
+            `invalid_domain_id` for a malformed path identifier.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Caller is not authenticated.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            Caller lacks the managed-push write ReBAC relation on the
+            addressed Domain.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+        "404":
+          description: |
+            The addressed Domain does not exist or is not visible. The
+            Problem body's `code` field is `domain_not_found`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "413":
+          description: |
+            The decoded kubeconfig exceeds the per-target size ceiling. The
+            Problem body's `code` field is `kubeconfig_too_large`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          description: |
+            The kubeconfig failed validation — for example it carries an
+            `exec` or `auth-provider` credential plugin, or is otherwise
+            malformed. The Problem body's `code` field is
+            `kubeconfig_invalid`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: |
+            The managed-push surface is not yet provisioned in this build,
+            so log scrapers can alert on the deferred-wiring state.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+    delete:
+      operationId: DeleteManagedPush
+      summary: Detach a Domain's managed-push target.
+      description: |
+        Detaches the managed-push target for a Domain, removing the sealed
+        kubeconfig and disabling further managed pushes. The handler runs
+        the managed-push write ReBAC check on the addressed Domain before
+        the delete, then removes the target and returns 204. A Domain with
+        no managed-push target receives 404 `managed_push_not_configured`.
+
+        DEFERRED-WIRING POSTURE: until the production composition root
+        supplies the managed-push service bundle, every request returns 501.
+      tags:
+        - hooks
+      parameters:
+        - $ref: "#/components/parameters/AuditDomainID"
+      responses:
+        "204":
+          description: |
+            Managed-push target detached. No response body.
+        "400":
+          description: |
+            The path `{domainId}` was not a non-zero UUID. The Problem
+            body's `code` field is `invalid_domain_id`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Caller is not authenticated.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            Caller lacks the managed-push write ReBAC relation on the
+            addressed Domain.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+        "404":
+          description: |
+            The Domain has no managed-push target configured. The Problem
+            body's `code` field is `managed_push_not_configured`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: |
+            The managed-push surface is not yet provisioned in this build,
+            so log scrapers can alert on the deferred-wiring state.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /v1/domains/{domainId}/managed-push/hooks:
+    post:
+      operationId: PushManagedHook
+      summary: Apply a PlexdHook to a Domain's managed-push cluster.
+      description: |
+        Applies one PlexdHook object to the Domain's managed-push cluster
+        on the operator's behalf, recording the push so it can be read back
+        or rolled back. The handler runs the managed-push write ReBAC check
+        on the addressed Domain before any cluster write, validates the
+        PlexdHook spec, then applies it to the target cluster.
+
+        The response is the read projection of the recorded push; it NEVER
+        echoes prior object content — only a `had_prior_state` boolean
+        recording whether the apply replaced an existing object, so a
+        subsequent rollback knows whether to restore or delete.
+
+        DEFERRED-WIRING POSTURE: until the production composition root
+        supplies the managed-push service bundle, every request returns 501.
+      tags:
+        - hooks
+      parameters:
+        - $ref: "#/components/parameters/AuditDomainID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManagedHookPushRequest"
+            example:
+              namespace: "platform-hooks"
+              name: "nightly-backup"
+              image_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              parameters:
+                schedule: "0 2 * * *"
+              timeout_seconds: 300
+              sandbox: true
+      responses:
+        "201":
+          description: |
+            PlexdHook applied. Body is the read projection of the recorded
+            push.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedHookPush"
+              example:
+                id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1"
+                domain_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"
+                hook_name: "nightly-backup"
+                namespace: "platform-hooks"
+                status: "applied"
+                had_prior_state: false
+                pushed_at: "2026-06-01T10:00:00Z"
+                rolled_back_at: null
+        "400":
+          description: |
+            The path `{domainId}` was not a non-zero UUID, or the request
+            body was malformed. The Problem body's `code` field is
+            `invalid_domain_id` for a malformed path identifier.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Caller is not authenticated.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            Caller lacks the managed-push write ReBAC relation on the
+            addressed Domain.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+        "404":
+          description: |
+            The Domain has no managed-push target configured. The Problem
+            body's `code` field is `managed_push_not_configured`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: |
+            The push could not be admitted. The Problem body's `code` field
+            is `managed_push_disabled` when the Domain's target exists but
+            is disabled, or `managed_push_conflict` when a concurrent push
+            against the same hook is in flight.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          description: |
+            The PlexdHook spec failed validation. The Problem body's `code`
+            field is `plexd_hook_invalid`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "502":
+          description: |
+            The managed-push cluster could not be reached to apply the
+            object. The Problem body's `code` field is
+            `cluster_unreachable`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: |
+            The managed-push surface is not yet provisioned in this build,
+            so log scrapers can alert on the deferred-wiring state.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /v1/domains/{domainId}/managed-push/hooks/{pushId}:
+    get:
+      operationId: GetManagedHookPush
+      summary: Read a single recorded managed-hook push.
+      description: |
+        Returns the read projection of a single recorded managed-hook push
+        by its identifier. The handler runs the managed-push read ReBAC
+        check on the addressed Domain before the read; a push that does not
+        exist on the Domain receives 404 `push_not_found`.
+
+        DEFERRED-WIRING POSTURE: until the production composition root
+        supplies the managed-push service bundle, every request returns 501.
+      tags:
+        - hooks
+      parameters:
+        - $ref: "#/components/parameters/AuditDomainID"
+        - $ref: "#/components/parameters/ManagedPushID"
+      responses:
+        "200":
+          description: |
+            Read projection of the recorded managed-hook push.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedHookPush"
+              example:
+                id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1"
+                domain_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"
+                hook_name: "nightly-backup"
+                namespace: "platform-hooks"
+                status: "applied"
+                had_prior_state: false
+                pushed_at: "2026-06-01T10:00:00Z"
+                rolled_back_at: null
+        "400":
+          description: |
+            The path `{domainId}` or `{pushId}` was not a non-zero UUID.
+            The Problem body's `code` field is `invalid_domain_id` for a
+            malformed Domain identifier.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Caller is not authenticated.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            Caller lacks the managed-push read ReBAC relation on the
+            addressed Domain.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+        "404":
+          description: |
+            No recorded push with that identifier exists on the Domain. The
+            Problem body's `code` field is `push_not_found`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: |
+            The managed-push surface is not yet provisioned in this build,
+            so log scrapers can alert on the deferred-wiring state.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /v1/domains/{domainId}/managed-push/hooks/{pushId}:rollback:
+    post:
+      operationId: RollbackManagedHookPush
+      summary: Roll back a recorded managed-hook push.
+      description: |
+        Rolls back a previously recorded managed-hook push: restores the
+        prior object state when the apply replaced an existing object, or
+        deletes the applied object when it had no prior state. The handler
+        runs the managed-push write ReBAC check on the addressed Domain
+        before the cluster write.
+
+        The `:rollback` colon-verb mirrors the
+        `/v1/projects/{project_id}/executions:dispatch` idiom — rollback is
+        a side-effecting cluster operation, not an idempotent field write.
+        A push that has already been rolled back receives 409
+        `push_already_rolled_back`.
+
+        DEFERRED-WIRING POSTURE: until the production composition root
+        supplies the managed-push service bundle, every request returns 501.
+      tags:
+        - hooks
+      parameters:
+        - $ref: "#/components/parameters/AuditDomainID"
+        - $ref: "#/components/parameters/ManagedPushID"
+      responses:
+        "200":
+          description: |
+            Push rolled back. Body is the read projection of the push with
+            `status: rolled_back`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManagedHookPush"
+              example:
+                id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1"
+                domain_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"
+                hook_name: "nightly-backup"
+                namespace: "platform-hooks"
+                status: "rolled_back"
+                had_prior_state: false
+                pushed_at: "2026-06-01T10:00:00Z"
+                rolled_back_at: "2026-06-01T11:00:00Z"
+        "400":
+          description: |
+            The path `{domainId}` or `{pushId}` was not a non-zero UUID.
+            The Problem body's `code` field is `invalid_domain_id` for a
+            malformed Domain identifier.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Caller is not authenticated.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            Caller lacks the managed-push write ReBAC relation on the
+            addressed Domain.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+        "404":
+          description: |
+            No recorded push with that identifier exists on the Domain. The
+            Problem body's `code` field is `push_not_found`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: |
+            The push has already been rolled back. The Problem body's
+            `code` field is `push_already_rolled_back`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "502":
+          description: |
+            The managed-push cluster could not be reached to roll back the
+            object. The Problem body's `code` field is
+            `cluster_unreachable`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: |
+            The managed-push surface is not yet provisioned in this build,
+            so log scrapers can alert on the deferred-wiring state.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
   /v1/platform/audit/entries:
     get:
       operationId: ListPlatformAuditEntries
@@ -16889,6 +17642,17 @@ components:
             error text on the wire: the cause is logged in the server's
             structured record only, and the Problem `detail` is a fixed,
             generic, retry-oriented string.
+        dimension:
+          type: string
+          description: |
+            Optional capacity-and-scale axis this problem concerns. Set
+            EXCLUSIVELY by the `capacity_exceeded` refusals — the per-Domain
+            observability-ingest byte ceiling (`observability_ingest`) and the
+            per-Domain concurrent action-execution ceiling
+            (`action_executions`) — so a client can attribute the throttle to a
+            specific scale axis without string-matching `detail`. The value is
+            one of the `CapacityDimension` members; other problem instances
+            omit the field.
         child_counts:
           allOf:
             - $ref: "#/components/schemas/DomainChildCounts"
@@ -25259,6 +26023,174 @@ components:
             the iteration has reached end-of-stream. The encoding is
             HMAC-signed so a tampered cursor surfaces as `400` on the
             next call.
+    # traceability: PX-0090, S065 — opt-in PlexdHook managed-push schemas.
+    ManagedPushAttachRequest:
+      type: object
+      description: |
+        Body for `PUT /v1/domains/{domainId}/managed-push`. Attaches or
+        replaces the Domain's managed-push target. The kubeconfig plaintext
+        carried here is base64-encoded, sealed at rest, and is NEVER echoed
+        back over the API — the read projection exposes only a hex
+        fingerprint of the plaintext.
+      required:
+        - kubeconfig_b64
+        - enabled
+      properties:
+        kubeconfig_b64:
+          type: string
+          format: byte
+          description: |
+            Base64-encoded kubeconfig for the managed-push cluster. The
+            decoded plaintext is validated and sealed at rest; it is never
+            echoed back in any response. Only embedded, in-band credentials
+            are accepted (a token, or `client-certificate-data` /
+            `client-key-data`, with `certificate-authority-data`); a
+            kubeconfig carrying an `exec` or `auth-provider` plugin, a
+            file-path credential (`tokenFile`, `client-certificate`,
+            `client-key`), a `certificate-authority` file path, or a
+            `proxy-url` is rejected with `kubeconfig_invalid`.
+        enabled:
+          type: boolean
+          description: |
+            Whether managed pushes are admitted against this target. A
+            disabled target rejects `PushManagedHook` with
+            `managed_push_disabled`.
+    ManagedPushTarget:
+      type: object
+      description: |
+        Display-only read projection of a Domain's managed-push target.
+        NEVER carries the kubeconfig ciphertext or plaintext — only the hex
+        SHA-256 fingerprint of the plaintext for display and drift checks.
+      required:
+        - enabled
+        - api_server_url
+        - kubeconfig_sha256
+        - created_at
+        - updated_at
+      properties:
+        enabled:
+          type: boolean
+          description: Whether managed pushes are admitted against this target.
+        api_server_url:
+          type: string
+          description: |
+            API-server URL of the managed-push cluster, parsed from the
+            attached kubeconfig.
+        kubeconfig_sha256:
+          type: string
+          description: |
+            Hex-encoded SHA-256 fingerprint of the kubeconfig plaintext.
+            Display-only — lets an operator confirm which kubeconfig is
+            sealed without exposing its contents.
+        created_at:
+          type: string
+          format: date-time
+          description: Timestamp the target was first attached.
+        updated_at:
+          type: string
+          format: date-time
+          description: Timestamp the target was last replaced.
+    ManagedHookPushRequest:
+      type: object
+      description: |
+        Body for `POST /v1/domains/{domainId}/managed-push/hooks`. Applies
+        one PlexdHook object to the Domain's managed-push cluster. The
+        PlexdHook spec fields mirror the discovery-only PlexdHook
+        projection.
+      required:
+        - namespace
+        - name
+        - image_digest
+      properties:
+        namespace:
+          type: string
+          description: Target namespace the PlexdHook is applied into.
+        name:
+          type: string
+          description: PlexdHook object name.
+        image_digest:
+          type: string
+          description: |
+            Pinned image digest the hook executes — a `sha256:` content
+            address, never a mutable tag.
+        parameters:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Opaque string-to-string parameter map forwarded to the hook.
+        timeout_seconds:
+          type: integer
+          format: int64
+          description: |
+            Per-invocation timeout in seconds. Zero or omitted leaves the
+            agent's default in force.
+        sandbox:
+          type: boolean
+          description: |
+            Whether the hook runs in the agent's sandboxed execution mode.
+    ManagedHookPush:
+      type: object
+      description: |
+        Read projection of one recorded managed-hook push. NEVER echoes the
+        prior object content — exposes only a `had_prior_state` boolean so a
+        subsequent rollback knows whether to restore or delete.
+      required:
+        - id
+        - domain_id
+        - hook_name
+        - namespace
+        - status
+        - had_prior_state
+        - pushed_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Recorded push identifier (UUIDv7).
+        domain_id:
+          type: string
+          format: uuid
+          description: Owning Domain identifier.
+        hook_name:
+          type: string
+          description: Name of the PlexdHook object applied.
+        namespace:
+          type: string
+          description: Namespace the hook was applied into.
+        status:
+          type: string
+          enum:
+            - applied
+            - rolled_back
+          # x-enum-varnames pins the generated Go constant names for this
+          # enum so oapi-codegen's "prefix only on collision" heuristic
+          # cannot flip the constant form when a sibling enum is added or
+          # removed (PX-0090, REQ-001).
+          x-enum-varnames:
+            - ManagedHookPushStatusApplied
+            - ManagedHookPushStatusRolledBack
+          description: |
+            Lifecycle status of the push. `applied` is the initial state
+            after the object lands on the cluster; `rolled_back` is the
+            terminal state after a successful rollback.
+        had_prior_state:
+          type: boolean
+          description: |
+            Whether the apply replaced an existing object. When `true` a
+            rollback restores the prior object; when `false` a rollback
+            deletes the applied object.
+        pushed_at:
+          type: string
+          format: date-time
+          description: Timestamp the object was applied.
+        rolled_back_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Timestamp the push was rolled back, or `null` when the push has
+            not been rolled back.
     # traceability: PX-0071 — Phase-3 plexd artifact registry list schemas.
     PlexdArtifactRef:
       type: object
@@ -25981,6 +26913,112 @@ components:
           items:
             $ref: "#/components/schemas/BridgeSiteToSiteTunnelResponse"
           description: Tunnels ordered by slug ascending.
+    CapacityDimension:
+      type: string
+      description: |
+        Closed enum of the six capacity-and-scale axes the platform tracks
+        per Domain. The wire string is the stable identifier operators and
+        automation match on; it surfaces in the Dashboard capacity view, in
+        the platform-audit threshold-crossing entry, and as the `dimension`
+        member of a `capacity_exceeded` Problem.
+      enum:
+        - nodes
+        - sse_fanout
+        - secret_reads
+        - mediated_sessions
+        - observability_ingest
+        - action_executions
+      # x-enum-varnames pins the generated Go constant names for this closed
+      # enum so oapi-codegen's "prefix only on collision" heuristic cannot
+      # flip the constant form when a sibling enum is added or removed
+      # elsewhere in the document.
+      # traceability: PX-0089, REQ-008
+      x-enum-varnames:
+        - CapacityDimensionNodes
+        - CapacityDimensionSSEFanout
+        - CapacityDimensionSecretReads
+        - CapacityDimensionMediatedSessions
+        - CapacityDimensionObservabilityIngest
+        - CapacityDimensionActionExecutions
+    CapacityUnit:
+      type: string
+      description: |
+        Closed enum of the unit a capacity dimension's `used` and `target`
+        values are expressed in. `count` is an absolute concurrent / enrolled
+        tally; the `_per_second` units are sustained rates.
+      enum:
+        - count
+        - events_per_second
+        - reads_per_second
+        - bytes_per_second
+      # x-enum-varnames keeps the generated constant form stable against the
+      # "prefix only on collision" heuristic.
+      # traceability: PX-0089, REQ-008
+      x-enum-varnames:
+        - CapacityUnitCount
+        - CapacityUnitEventsPerSecond
+        - CapacityUnitReadsPerSecond
+        - CapacityUnitBytesPerSecond
+    DomainCapacityDimensionReading:
+      type: object
+      description: |
+        One capacity dimension's reading within a `DomainCapacitySnapshot`:
+        the dimension identifier, its unit, the latest sampled usage, the
+        per-Domain target, and the `used / target` ratio the Dashboard
+        renders as a percentage.
+      required:
+        - dimension
+        - unit
+        - used
+        - target
+        - ratio
+      properties:
+        dimension:
+          $ref: "#/components/schemas/CapacityDimension"
+        unit:
+          $ref: "#/components/schemas/CapacityUnit"
+        used:
+          type: number
+          description: |
+            Latest sampled usage for the dimension, in the dimension's
+            `unit` (an absolute tally for `count`, a sustained rate for the
+            `_per_second` units).
+        target:
+          type: number
+          description: |
+            The per-Domain target for the dimension, in the dimension's
+            `unit`. A target of `0` means no target is configured.
+        ratio:
+          type: number
+          description: |
+            `used / target`, the fraction of the target currently consumed.
+            `0` when no target is configured. A value at or above `0.8` is the
+            threshold the collector records a crossing for.
+    DomainCapacitySnapshot:
+      type: object
+      description: |
+        Per-Domain capacity snapshot returned by
+        `GET /v1/domains/{domainId}/capacity`: the wall-clock instant the
+        collector last sampled, and one reading per catalogued capacity
+        dimension in the canonical Dashboard order.
+      required:
+        - sampled_at
+        - dimensions
+      properties:
+        sampled_at:
+          type: string
+          format: date-time
+          description: |
+            RFC 3339 timestamp at which the collector last sampled the
+            Domain's usage. The snapshot is unavailable (`503`) until the
+            first sample completes.
+        dimensions:
+          type: array
+          items:
+            $ref: "#/components/schemas/DomainCapacityDimensionReading"
+          description: |
+            One reading per catalogued capacity dimension, in the canonical
+            order used by the Dashboard capacity view.
   parameters:
     DomainID:
       in: path
@@ -26239,6 +27277,18 @@ components:
         affected Domain's chain, never on a shared system chain
         . Every audit endpoint requires the Domain
         identifier in the path.
+    # traceability: PX-0090, S065 — managed-hook push identifier.
+    ManagedPushID:
+      in: path
+      name: pushId
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: |
+        Recorded managed-hook push identifier (UUIDv7). Bound on
+        `/v1/domains/{domainId}/managed-push/hooks/{pushId}` and its
+        `:rollback` sub-resource for the single-push read and rollback.
     PrincipalID:
       in: path
       name: principalId
