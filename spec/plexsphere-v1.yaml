@@ -4065,6 +4065,30 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "503":
+          description: |
+            The signed event bus is temporarily unavailable because the
+            backing message bus (NATS JetStream) is unreachable, so the
+            stream could not be opened. The Problem body's `code` field
+            is `event_stream_unavailable` and the `detail` is a fixed,
+            generic, retry-oriented string — the underlying subscribe
+            error is recorded only in the server's structured log,
+            never on the wire. The reconciliation-pull
+            `GET /v1/nodes/{id}/state` surface does NOT depend on the
+            message bus and stays available during the same outage, so a
+            client that receives this code can keep reconciling from the
+            pull path while it retries the stream.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/event-stream-unavailable"
+                title: "Service Unavailable"
+                status: 503
+                detail: "the event stream is temporarily unavailable; retry shortly."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/events"
+                code: "event_stream_unavailable"
         "501":
           description: |
             The Signed Event Bus surface is not yet provisioned in
@@ -4171,6 +4195,31 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "503":
+          description: |
+            The datastore (Postgres) is temporarily unreachable AND no
+            fresh-enough cached snapshot exists for the addressed Node,
+            so a reconciliation pull could not be served. The Problem
+            body's `code` field is `datastore_unavailable` and the
+            `detail` is a fixed, generic, retry-oriented string — the
+            underlying datastore error is recorded only in the server's
+            structured log, never on the wire. A Node whose last
+            successful snapshot is cached and fresher than the per-
+            deployment stale-read TTL is still served `200` from that
+            last-known-good snapshot during the same outage, so an
+            existing Node keeps its desired state rather than seeing a
+            generic 5xx — only a cold-cache Node receives this code.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/datastore-unavailable"
+                title: "Service Unavailable"
+                status: 503
+                detail: "the datastore is temporarily unavailable; retry shortly."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state"
+                code: "datastore_unavailable"
         "501":
           description: |
             The reconciliation-pull surface is not yet provisioned in
@@ -15879,6 +15928,36 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "503":
+          description: |
+            A dependency the issuance path needs is temporarily
+            unavailable, so the session could not be minted. Body is a
+            `Problem` whose `code` is one of the dependency-degradation
+            codes documented on the `Problem.code` schema:
+
+              * `signing_unavailable` — the Signing Service is
+                unreachable, so the session token could not be signed.
+              * `authz_unavailable` — the ReBAC backend (SpiceDB) is
+                unreachable, so the issuance authorization check could
+                not be reached (the global degradation code emitted by
+                every ReBAC-gated operation).
+
+            No Session row is persisted and no token is issued on this
+            path, so a retry after the dependency recovers is safe. The
+            `detail` is a fixed, generic, retry-oriented string — the
+            underlying error is recorded only in the server's structured
+            log, never on the wire.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.dev/errors/signing-unavailable"
+                title: "Service Unavailable"
+                status: 503
+                detail: "the signing backend is temporarily unavailable; retry shortly."
+                instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1/sessions"
+                code: "signing_unavailable"
         "501":
           description: |
             The access-orchestrator surface is not yet provisioned in this
@@ -16764,6 +16843,52 @@ components:
             `request_body_too_large`, `permission_denied`,
             `unauthenticated`, and `internal` codes with the same
             semantics they carry on the Tenancy Resource surface above.
+
+            Dependency-degradation codes are global rather than scoped to
+            a single surface: any operation can return `503` when a
+            dependency it needs is briefly unavailable, instead of a
+            generic `5xx`, so a client branches on `code` to back off,
+            fail over, or page rather than string-matching opaque internal
+            errors. Each code maps to one dependency outage and one HTTP
+            status; the operator runbook is
+            `docs/operations/failure-modes.md`:
+
+              * `authz_unavailable` — 503, the ReBAC backend (SpiceDB) is
+                unreachable so an authorization decision could not be
+                reached. Emitted GLOBALLY by every ReBAC-gated operation —
+                no handler fails open. Within the per-Domain stale-check
+                TTL a last-known-good allow/deny may be served instead
+                (recorded under a distinct audit reason); past the TTL, or
+                for a subject not in the stale cache, the operation
+                returns this code.
+              * `event_stream_unavailable` — 503, `GetNodeEvents` could
+                not open the signed event stream because the message bus
+                (NATS JetStream) is unreachable. The reconciliation-pull
+                `GetNodeState` path does not depend on the message bus and
+                stays available during the same outage.
+              * `datastore_unavailable` — 503, `GetNodeState` could not
+                serve a snapshot because the datastore (Postgres) is
+                unreachable AND no fresh-enough cached snapshot exists for
+                the addressed Node. A Node with a fresh-enough cached
+                snapshot is still served `200` during the same outage.
+              * `signing_unavailable` — 503, `IssueSession` could not mint
+                a session token because the Signing Service is
+                unreachable. No Session is persisted and no token issued,
+                so a retry after recovery is safe.
+              * `openbao_unavailable` — 503, a node-secret read could not
+                complete because the secret backend (OpenBao) is sealed or
+                unreachable. DIVERGENCE NOTE: the project README's
+                degradation table uses the illustrative string
+                `secret-backend-unavailable` for this case, but the
+                shipped wire code is `openbao_unavailable`. The wire code
+                is authoritative — renaming it would be a breaking change
+                for zero behavioural gain — so the divergence is
+                documented here rather than reconciled.
+
+            None of the dependency-degradation codes carry the underlying
+            error text on the wire: the cause is logged in the server's
+            structured record only, and the Problem `detail` is a fixed,
+            generic, retry-oriented string.
         child_counts:
           allOf:
             - $ref: "#/components/schemas/DomainChildCounts"
