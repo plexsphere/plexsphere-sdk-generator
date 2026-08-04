@@ -46,8 +46,10 @@ info:
     identifier: BUSL-1.1
 # Document-wide default: a caller authenticates with the browser
 # session cookie or an operator bearer token. Operations on the authn
-# bypass list opt out with `security: []`; the node-agent surface
-# overrides to `nskBearer`. See the DECISION on securitySchemes.
+# bypass list opt out with `security: []`; the node-agent write surface
+# overrides to `nskBearer` alone, and the node-agent read surface adds
+# `nskBearer` as an alternative to this default. See the DECISION on
+# securitySchemes.
 security:
   - sessionCookie: []
   - operatorBearer: []
@@ -442,6 +444,7 @@ paths:
                 status: 500
                 detail: "health probe panicked"
                 instance: "/v1/health"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
   /v1/version:
     get:
       operationId: GetVersion
@@ -472,6 +475,7 @@ paths:
                 status: 500
                 detail: "build metadata unavailable"
                 instance: "/v1/version"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
   /v1/openapi.json:
     get:
       operationId: GetOpenAPI
@@ -508,6 +512,7 @@ paths:
                 status: 500
                 detail: "failed to marshal OpenAPI document"
                 instance: "/v1/openapi.json"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
   /v1/docs:
     get:
       operationId: GetDocs
@@ -543,6 +548,7 @@ paths:
                 status: 500
                 detail: "failed to render embedded ReDoc shell"
                 instance: "/v1/docs"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
   /v1/docs/assets/{asset}:
     get:
       operationId: GetDocsAsset
@@ -588,6 +594,7 @@ paths:
                 status: 404
                 detail: "No vendored ReDoc asset named redoc.unknown.js"
                 instance: "/v1/docs/assets/redoc.unknown.js"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error reading the bundle asset.
           content:
@@ -600,6 +607,7 @@ paths:
                 status: 500
                 detail: "failed to read vendored ReDoc asset"
                 instance: "/v1/docs/assets/redoc.standalone.js"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
   # traceability: PX-0071 — plexd artifact registry list surface.
   /v1/artifacts/plexd:
     get:
@@ -674,6 +682,10 @@ paths:
   /v1/artifacts/plexd/{version}:
     get:
       operationId: GetPlexdArtifact
+      security:
+        - nskBearer: []
+        - sessionCookie: []
+        - operatorBearer: []
       summary: Fetch one indexed plexd release by version.
       description: |
         Returns the indexed plexd release line identified by `{version}`
@@ -687,6 +699,13 @@ paths:
         The verbatim Sigstore bundle attesting each build is NOT inlined
         in this record; fetch it from the `{version}/sigstore` companion
         endpoint so an operator can re-verify the attestation independently.
+
+        A registered Node's NSK authenticates this read directly: the
+        plexd release registry is platform-global and read-only, so a
+        valid, non-revoked NSK is sufficient authorization for a node
+        pulling its own upgrade verdict — the NSK arm adds no 403. The
+        operator path (the platform read relation, with a denial
+        collapsing onto the same `404 release_not_found`) is unchanged.
       tags:
         - artifacts
       parameters:
@@ -731,6 +750,7 @@ paths:
                 detail: "no indexed plexd release with version v1.4.2"
                 instance: "/v1/artifacts/plexd/v1.4.2"
                 code: "release_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -740,6 +760,10 @@ paths:
   /v1/artifacts/plexd/{version}/sigstore:
     get:
       operationId: GetPlexdArtifactSignature
+      security:
+        - nskBearer: []
+        - sessionCookie: []
+        - operatorBearer: []
       summary: Fetch the verbatim Sigstore bundle for a plexd release.
       description: |
         Returns the raw, verbatim upstream Sigstore bundle the registry
@@ -751,6 +775,13 @@ paths:
         identity to confirm the build provenance without trusting this
         server. A version that has never been indexed, or whose cached
         bundle is absent, surfaces as `404 release_not_found`.
+
+        A registered Node's NSK authenticates this read directly: the
+        plexd release registry is platform-global and read-only, so a
+        valid, non-revoked NSK is sufficient authorization for a node
+        verifying its own build provenance — the NSK arm adds no 403.
+        The operator path (the platform read relation, with a denial
+        collapsing onto the same `404 release_not_found`) is unchanged.
       tags:
         - artifacts
       parameters:
@@ -789,6 +820,7 @@ paths:
                 detail: "no indexed plexd release with version v1.4.2"
                 instance: "/v1/artifacts/plexd/v1.4.2/sigstore"
                 code: "release_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -1740,10 +1772,16 @@ paths:
                 $ref: "#/components/schemas/RelationTuple"
         "400":
           description: |
-            Aggregate invariant rejected the body — empty subject /
-            relation / resource, malformed object reference, etc. Body
-            is a `Problem` with `code` ∈ { `invalid_relation_tuple`,
-            `invalid_body` }.
+            The triple is not writable. Body is a `Problem` with
+            `code` ∈ { `invalid_triple`, `invalid_project_id`,
+            `invalid_body` }. `invalid_triple` covers both the shape
+            checks the handler makes itself — empty subject / relation
+            / resource — and the schema rejections only the ReBAC
+            backend can make: an unknown object definition, an unknown
+            relation, a subject type the relation does not admit, or a
+            PERMISSION named where a relation belongs. Permissions are
+            computed from relations, so nothing can be written into
+            one; grant a relation the permission derives from instead.
           content:
             application/problem+json:
               schema:
@@ -1784,6 +1822,17 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "503":
+          description: |
+            The ReBAC backend is unreachable, so neither the
+            authorization decision nor the tuple write could be
+            reached. Body is a `Problem` with `code:
+            authz_unavailable`. Nothing was written, and the write is
+            idempotent, so retrying after the backend recovers is safe.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
   /v1/authz/relation-tuples/{id}:
     patch:
       operationId: PatchRelationTuple
@@ -1814,7 +1863,13 @@ paths:
         "400":
           description: |
             Path `{id}` was not a non-zero UUID, body was empty, or the
-            new tuple invariants were rejected. Body is a `Problem`.
+            replacement triple is not writable — the same
+            `invalid_triple` contract `CreateRelationTuple` documents,
+            including the schema rejections only the ReBAC backend can
+            make. Note that the delete leg runs first, so a
+            replacement the backend refuses leaves the old tuple
+            already deleted; the `detail` says so. Body is a
+            `Problem`.
           content:
             application/problem+json:
               schema:
@@ -4181,6 +4236,10 @@ paths:
   /v1/nodes/{id}/events:
     get:
       operationId: GetNodeEvents
+      security:
+        - nskBearer: []
+        - sessionCookie: []
+        - operatorBearer: []
       summary: Stream signed envelope events for a Node over SSE.
       description: |
         Opens a Server-Sent Events stream of canonical signed
@@ -4206,16 +4265,30 @@ paths:
         `Cache-Control: no-cache` opts the response out of any
         intermediary caching layer.
 
-        DESCOPED FOR THE FIRST PRODUCTION RELEASE: the signed SSE event
-        bus does not ship in the first production release —
-        reconciliation-pull (GET /v1/nodes/{id}/state) is the working
-        delivery channel for mesh state. The production composition root
-        wires none of the load-bearing EventStream, NonceStore,
-        SignatureVerifier, RelationChecker, or NodeRepo ports, so every
-        request to this endpoint returns 501 with `code:
-        signed_event_bus_not_provisioned`, fail-closed by construction.
-        See docs/architecture/mesh-event-bus-roadmap.md for the descope
-        decision and the full un-descope checklist.
+        This read is a dual-credential surface. A node agent
+        authenticates with its NSK carried in the
+        `Authorization: Bearer` header; the NSK arm enforces an equality
+        gate — the authenticated Node must equal the addressed `{id}` —
+        and runs no ReBAC relation check. A cross-Node NSK is refused
+        with `403 node_id_mismatch` so a leaked credential cannot
+        subscribe to a sibling Node's stream, and a revoked NSK is
+        refused with `401 nsk_revoked`. The operator arm (session cookie
+        or operator bearer JWT plus the `node-agent` relation on the
+        Node) is unchanged.
+
+        CONDITIONAL POSTURE: the signed SSE event bus is a latency
+        optimisation layered over the reconciliation-pull baseline
+        (GET /v1/nodes/{id}/state), which stays the authoritative
+        delivery channel for mesh state. This endpoint answers 501 with
+        `code: signed_event_bus_not_provisioned` until the operator
+        configures the event-bus seams — the EventStream, NonceStore,
+        SignatureVerifier, RelationChecker, and NodeRepo ports — after
+        which it streams signed envelopes. The bus is single-replica: the
+        backing PLEXSPHERE_NODE_EVENTS JetStream stream and the in-memory
+        replay-protection store require the API server to run a single
+        replica until a distributed nonce store is wired. See
+        docs/architecture/mesh-event-bus-roadmap.md for the un-descope
+        checklist and the single-replica constraint.
       tags:
         - mesh
       parameters:
@@ -4244,16 +4317,20 @@ paths:
             unbounded `text/event-stream` — each event frame carries
             an `id:` (JetStream sequence), an `event:` discriminator,
             and a `data:` line whose payload is the canonical signed
-            envelope JSON. The currently emitted `event:` values are
-            `node_state_updated`, `policy_updated`, and
-            `bridge_config_updated`; `policy_updated` carries the
+            envelope JSON. The emitted `event:` values are
+            `node_state_updated`, `policy_updated`,
+            `bridge_config_updated`, `action_request`, and
+            `session_setup`; `policy_updated` carries the
             per-(Node, Policy) compiled-ruleset projection described by
-            `PolicyUpdatedPayload`, while `bridge_config_updated`
-            carries the per-(Node, bridge Resource) delivered-config
-            projection described by `BridgeConfigUpdatedPayload`.
-            Additional discriminators land as the README's 14-type
-            taxonomy ships. Comment frames every 25 seconds keep idle
-            proxies from collapsing the connection.
+            `PolicyUpdatedPayload`, `bridge_config_updated` carries the
+            per-(Node, bridge Resource) delivered-config projection
+            described by `BridgeConfigUpdatedPayload`, `action_request`
+            carries the per-Node action dispatch described by
+            `SSEEventActionRequest`, and `session_setup` carries the
+            per-Node session provisioning payload described by
+            `SSEEventSessionSetup`. Additional discriminators land as
+            the README's 14-type taxonomy ships. Comment frames every 25
+            seconds keep idle proxies from collapsing the connection.
           headers:
             X-Plexsphere-API-Version:
               description: |
@@ -4308,6 +4385,10 @@ paths:
                   $ref: "#/components/schemas/PolicyUpdatedPayload"
                 bridge_config_updated:
                   $ref: "#/components/schemas/BridgeConfigUpdatedPayload"
+                action_request:
+                  $ref: "#/components/schemas/SSEEventActionRequest"
+                session_setup:
+                  $ref: "#/components/schemas/SSEEventSessionSetup"
         "400":
           description: |
             `Last-Event-ID` header was present but unparseable —
@@ -4318,15 +4399,21 @@ paths:
               schema:
                 $ref: "#/components/schemas/Problem"
         "401":
-          description: Caller is not authenticated.
+          description: |
+            Caller is not authenticated — no session cookie, operator
+            bearer JWT, or NSK resolved. On the NSK arm a missing or
+            malformed key surfaces here with `code: nsk_invalid` and a
+            revoked key with `code: nsk_revoked`.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
         "403":
           description: |
-            Caller lacks the node-agent ReBAC relation on the
-            addressed Node and may not subscribe to its event stream.
+            Operator caller lacks the node-agent ReBAC relation on the
+            addressed Node and may not subscribe to its event stream. On
+            the NSK arm a cross-Node key surfaces here with
+            `code: node_id_mismatch`.
           content:
             application/problem+json:
               schema:
@@ -4361,17 +4448,17 @@ paths:
                 detail: "the event stream is temporarily unavailable; retry shortly."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/events"
                 code: "event_stream_unavailable"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "501":
           description: |
-            The Signed Event Bus surface is descoped from the first
-            production release and always answers 501 in the production
-            binary. The Problem body's `code` field is
+            The Signed Event Bus surface has not been provisioned in this
+            deployment and answers 501 until the operator configures the
+            event-bus seams. The Problem body's `code` field is
             `signed_event_bus_not_provisioned` so log scrapers can alert
-            on the descoped state. The surface can only return a stream
-            once EventStream, NonceStore, SignatureVerifier,
-            RelationChecker, and NodeRepo are
-            wired into the v1 handler dependency cone — see
-            docs/architecture/mesh-event-bus-roadmap.md.
+            on the unprovisioned state. The surface returns a stream once
+            EventStream, NonceStore, SignatureVerifier, RelationChecker,
+            and NodeRepo are wired into the v1 handler dependency cone —
+            see docs/architecture/mesh-event-bus-roadmap.md.
           content:
             application/problem+json:
               schema:
@@ -4383,6 +4470,7 @@ paths:
                 detail: "GET /v1/nodes/{id}/events requires the production wiring of EventStream, NonceStore, SignatureVerifier, RelationChecker, and NodeRepo. One or more ports are not yet provisioned in this build (see docs/architecture/mesh-event-bus-roadmap.md)."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/events"
                 code: "signed_event_bus_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: |
             Internal server error. Body is a `Problem` with
@@ -4394,6 +4482,10 @@ paths:
   /v1/nodes/{id}/state:
     get:
       operationId: GetNodeState
+      security:
+        - nskBearer: []
+        - sessionCookie: []
+        - operatorBearer: []
       summary: Reconciliation pull for a Node — return the canonical NodeStateSnapshot.
       description: |
         Returns the canonical `NodeStateSnapshot` for the addressed
@@ -4402,10 +4494,20 @@ paths:
         when its SSE connection has been disconnected for longer than
         the replay window, or when an out-of-band request arrives to
         re-derive the desired state. The wire blocks — `peers`,
-        `policy`, `bridge`, `state`, and `reports` — are always present
-        so plexd's reconcile loop can diff by field presence rather
-        than absence; later stories populate the
-        currently-empty blocks without changing the wire shape.
+        `policy`, `bridge`, `state`, `reports`, `executions`, and
+        `sessions` — are always present so plexd's reconcile loop can
+        diff by field presence rather than absence; later stories
+        populate the currently-empty blocks without changing the wire
+        shape.
+
+        The `executions` and `sessions` blocks carry the Node's pending
+        action dispatches and its live mediated sessions. With no event
+        channel delivering dispatches, this reconciliation pull is the
+        correctness-baseline delivery path for both: a Node learns of a
+        pending dispatch or a session setup by pulling the snapshot and
+        acknowledges it through the existing callbacks. An entry drains
+        from `executions` when its target reaches a terminal status and
+        from `sessions` on revocation or expiry.
 
         The peer projection is a single SQL round-trip ordered by
         `node_id ASC` so two consecutive pulls against the same
@@ -4420,6 +4522,17 @@ paths:
         unknown Node id surfaces as 404 only after the authorisation
         gate passes so the endpoint cannot be used as a Node-id
         oracle.
+
+        This read is a dual-credential surface. A node agent
+        authenticates with its NSK carried in the
+        `Authorization: Bearer` header; the NSK arm enforces an equality
+        gate — the authenticated Node must equal the addressed `{id}` —
+        and runs no ReBAC relation check. A cross-Node NSK is refused
+        with `403 node_id_mismatch` so a leaked credential cannot pull a
+        sibling Node's snapshot, and a revoked NSK is refused with
+        `401 nsk_revoked`. The operator arm (session cookie or operator
+        bearer JWT plus the `node-agent` relation on the Node) is
+        unchanged.
 
         DEFERRED-WIRING POSTURE: until the production
         composition root supplies the `SnapshotProvider`,
@@ -4444,24 +4557,32 @@ paths:
             Canonical `NodeStateSnapshot` for the addressed Node. The
             `peers` array carries one entry per other Node in the
             addressed Node's Domain; the addressed Node itself is
-            excluded so plexd does not program a self-peer. The remaining blocks (`policy`, `bridge`,
-            `state`, `reports`) are present-but-empty placeholders
-            that later stories populate without changing the wire
-            shape.
+            excluded so plexd does not program a self-peer. The
+            `executions` and `sessions` arrays carry the Node's pending
+            action dispatches and live mediated sessions (`[]` when
+            empty). The remaining blocks (`policy`, `bridge`, `state`,
+            `reports`) are present-but-empty placeholders that later
+            stories populate without changing the wire shape.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/NodeStateSnapshot"
         "401":
-          description: Caller is not authenticated.
+          description: |
+            Caller is not authenticated — no session cookie, operator
+            bearer JWT, or NSK resolved. On the NSK arm a missing or
+            malformed key surfaces here with `code: nsk_invalid` and a
+            revoked key with `code: nsk_revoked`.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
         "403":
           description: |
-            Caller lacks the `node-agent` ReBAC relation on the
-            addressed Node and may not issue a reconciliation pull.
+            Operator caller lacks the `node-agent` ReBAC relation on the
+            addressed Node and may not issue a reconciliation pull. On
+            the NSK arm a cross-Node key surfaces here with
+            `code: node_id_mismatch`.
           content:
             application/problem+json:
               schema:
@@ -4500,6 +4621,7 @@ paths:
                 detail: "the datastore is temporarily unavailable; retry shortly."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state"
                 code: "datastore_unavailable"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "501":
           description: |
             The reconciliation-pull surface is not yet provisioned in
@@ -4522,6 +4644,7 @@ paths:
                 detail: "GET /v1/nodes/{id}/state requires the production wiring of SnapshotProvider, RelationChecker, and NodeRepo. One or more ports are not yet provisioned in this build (see docs/architecture/mesh-event-bus-roadmap.md)."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state"
                 code: "signed_event_bus_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: |
             Internal server error. Body is a `Problem` with
@@ -4556,7 +4679,13 @@ paths:
              reachability state-machine (`healthy` → `stale` after 90s,
              `stale` → `unreachable` after 300s) so the projection at
              `GET /v1/nodes/{id}/reachability` reflects the new fact
-             on the next read.
+             on the next read. A Node starts in `never_reported` and
+             stays there until its first heartbeat is admitted. The
+             evaluator's recovery sweep observes that heartbeat on the
+             next tick and moves the Node to a heartbeat-derived
+             verdict (`healthy`, or `stale`/`unreachable` when the lone
+             heartbeat is already older than the thresholds), and a
+             transition event records the exit.
 
         The 200 response carries `accepted_at` (server timestamp at
         commit) and two reconciliation flags. `reconcile` defaults to
@@ -4592,7 +4721,7 @@ paths:
               $ref: "#/components/schemas/HeartbeatRequest"
             example:
               client_now: "2026-04-27T10:15:30Z"
-              binary_checksum: "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
+              binary_checksum: "XohImNooBHFR0OVvjcYpJ3NgPQ1qq73WKhHvch0VQtg="
               binary_version: "plexd-v0.4.2-ge5f3a1c"
               nat_summary: {}
       responses:
@@ -4638,6 +4767,7 @@ paths:
                 detail: "client_now drifted by 142s from server now; heartbeats must be within +/-60s of server time."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/heartbeat"
                 code: "clock_skew"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: |
             The NSK credential in the `Authorization: Bearer` header
@@ -4657,6 +4787,7 @@ paths:
                 detail: "NSK presented in Authorization: Bearer has been revoked."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/heartbeat"
                 code: "nsk_revoked"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "403":
           description: |
             The NSK in the `Authorization: Bearer` header authenticates
@@ -4697,6 +4828,7 @@ paths:
                 detail: "POST /v1/nodes/{id}/heartbeat requires the production wiring of NSKValidator, ReachabilityRepo, and Clock. One or more ports are not yet provisioned in this build (see docs/architecture/mesh-event-bus-roadmap.md)."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/heartbeat"
                 code: "heartbeat_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: |
             Internal server error. Body is a `Problem` with
@@ -4823,6 +4955,7 @@ paths:
                 detail: "reported_at drifted by 142s from server now; endpoint observations must be within +/-60s of server time."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/endpoint"
                 code: "endpoint_clock_skew"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: |
             The NSK credential in the `Authorization: Bearer` header
@@ -4842,6 +4975,7 @@ paths:
                 detail: "NSK presented in Authorization: Bearer has been revoked."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/endpoint"
                 code: "nsk_revoked"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "403":
           description: |
             The NSK in the `Authorization: Bearer` header authenticates
@@ -4879,6 +5013,7 @@ paths:
                 detail: "no live Peer is registered for the addressed Node."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/endpoint"
                 code: "endpoint_peer_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "410":
           description: |
             The target Peer was deregistered between the handler's
@@ -4898,6 +5033,7 @@ paths:
                 detail: "the addressed Peer was deregistered before the observation could be recorded."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/endpoint"
                 code: "endpoint_peer_gone"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: |
             Request body exceeded the 4 KiB ceiling enforced by the
@@ -4916,6 +5052,7 @@ paths:
                 detail: "request body exceeds the 4096-byte endpoint envelope cap."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/endpoint"
                 code: "endpoint_body_too_large"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "501":
           description: |
             The endpoint intake surface is not yet provisioned in this
@@ -4935,6 +5072,7 @@ paths:
                 detail: "PUT /v1/nodes/{id}/endpoint requires the production wiring of EndpointRecorder, NSKResolver, NodeRepo, and PeerLookup. One or more ports are not yet provisioned in this build."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/endpoint"
                 code: "endpoint_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
   # traceability: PX-0078, REQ-011, REQ-012, REQ-015
         "500":
           description: |
@@ -5096,6 +5234,7 @@ paths:
                 detail: "NSK presented in Authorization: Bearer is missing or has been revoked."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/secrets/db-password"
                 code: "unauthorized"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "403":
           description: |
             The NSK authenticates successfully but the calling Node lacks
@@ -5143,6 +5282,7 @@ paths:
                 detail: "no secret named db-password is visible to the addressed Node."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/secrets/db-password"
                 code: "secret_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "429":
           description: |
             The per-Node or per-Domain secret-fetch rate-limit bucket is
@@ -5170,6 +5310,7 @@ paths:
                 detail: "per-Node secret-fetch rate limit exceeded; retry after the window refills."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/secrets/db-password"
                 code: "per_node_rate_limited"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "503":
           description: |
             The OpenBao backend is sealed or unavailable, so an
@@ -5188,6 +5329,7 @@ paths:
                 detail: "the secret backend is sealed or unreachable; the authorized read could not be completed."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/secrets/db-password"
                 code: "openbao_unavailable"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "501":
           description: |
             The Secret Store surface is not yet provisioned in this
@@ -5208,6 +5350,7 @@ paths:
                 detail: "GET /v1/nodes/{id}/secrets/{name} requires the Secret Store backend to be configured. The surface is not provisioned in this build."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/secrets/db-password"
                 code: "secrets_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -5292,6 +5435,7 @@ paths:
                 detail: "the report value exceeds the 4096-byte limit."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
                 code: "invalid_report"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: |
             The NSK credential in the `Authorization: Bearer` header
@@ -5311,6 +5455,7 @@ paths:
                 detail: "NSK presented in Authorization: Bearer is missing or has been revoked."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
                 code: "unauthorized"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "403":
           description: |
             The NSK authenticates but resolves to a different Node than
@@ -5346,6 +5491,7 @@ paths:
                 detail: "node id does not match any Node in this Domain."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
                 code: "node_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "409":
           description: |
             The per-Node report quota is exhausted — the write would
@@ -5372,6 +5518,7 @@ paths:
                 detail: "the request body exceeds the maximum allowed size."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
                 code: "payload_too_large"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "501":
           description: |
             The node-state service is not yet provisioned in this build.
@@ -5388,6 +5535,7 @@ paths:
                 detail: "PUT /v1/nodes/{id}/state/reports/{key} requires the production wiring of the node-state service. The surface is not provisioned in this build."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
                 code: "reports_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -5456,6 +5604,7 @@ paths:
                 detail: "NSK presented in Authorization: Bearer is missing or has been revoked."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
                 code: "unauthorized"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "403":
           description: |
             The NSK resolves to a different Node than the path `id` — a
@@ -5492,6 +5641,7 @@ paths:
                 detail: "no report entry exists under the addressed key for this Node."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
                 code: "report_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "501":
           description: |
             The node-state service is not yet provisioned in this build.
@@ -5507,6 +5657,7 @@ paths:
                 detail: "DELETE /v1/nodes/{id}/state/reports/{key} requires the production wiring of the node-state service. The surface is not provisioned in this build."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/state/reports/cpu-load"
                 code: "reports_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -5543,8 +5694,11 @@ paths:
              non-empty, `binary_checksum` exactly 32 bytes,
              `ssh_host_key_fingerprint` empty or matching
              `SHA256:<base64>`, no duplicate hook names, hook count
-             within the per-manifest cap, and every hook's `checksum`
-             exactly 32 bytes.
+             within the per-manifest cap, every hook's `checksum`
+             exactly 32 bytes, and — for the advertised
+             `builtin_actions` inventory — no duplicate action names,
+             no duplicate parameter names within one action, and both
+             counts within their caps.
           6. Persists the snapshot inside a single transaction. When
              the supplied manifest differs from the prior persisted
              row, the recorder appends a `NodeCapabilitiesUpdated`
@@ -5596,6 +5750,21 @@ paths:
                     retention: "7d"
                   timeout_seconds: 300
                   sandbox: true
+              builtin_actions:
+                - name: "diagnostics.collect"
+                  description: "Collect a diagnostics bundle from the node."
+                  parameters:
+                    - name: "since"
+                      type: "duration"
+                      required: false
+                      description: "How far back to collect logs."
+                - name: "service.upgrade"
+                  description: "Upgrade the plexd binary to a target version."
+                  parameters:
+                    - name: "version"
+                      type: "string"
+                      required: true
+                      description: "Target plexd release to upgrade to."
       responses:
         "200":
           description: |
@@ -5651,6 +5820,7 @@ paths:
                 detail: "binary_checksum must be exactly 32 bytes (raw SHA-256)."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/capabilities"
                 code: "binary_checksum_invalid"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: |
             The NSK credential in the `Authorization: Bearer` header
@@ -5677,6 +5847,7 @@ paths:
                 detail: "NSK presented in Authorization: Bearer has been revoked."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/capabilities"
                 code: "nsk_revoked"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "403":
           description: |
             The NSK in the `Authorization: Bearer` header authenticates
@@ -5715,6 +5886,7 @@ paths:
                 detail: "node not found."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/capabilities"
                 code: "capabilities_node_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: |
             Request body exceeded the 32 KiB ceiling enforced by the
@@ -5733,11 +5905,14 @@ paths:
                 detail: "request body exceeds the 32768-byte capabilities envelope cap."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/capabilities"
                 code: "capabilities_body_too_large"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "422":
           description: |
             A `plexd_hooks` entry — the discovered Kubernetes PlexdHook
-            list — failed a value-object invariant. The structurally
-            well-formed envelope decoded, but a discovered-hook value is
+            list — or a `builtin_actions` entry failed a value-object
+            invariant. The structurally
+            well-formed envelope decoded, but an advertised-inventory
+            value is
             semantically invalid, so the surface returns 422 rather than
             the 400 reserved for structural/declared-hook failures. The
             Problem body's `code` field disambiguates the cause and is
@@ -5751,6 +5926,14 @@ paths:
                 entries with the same `name`.
               - `plexd_hooks_too_many` — `plexd_hooks` exceeds the
                 per-manifest cap of 128 entries.
+              - `builtin_action_invalid` — a `builtin_actions` entry
+                has an empty `name`, or carries a `parameters` entry
+                with an empty `name` or a duplicate parameter `name`.
+              - `builtin_action_duplicate` — `builtin_actions` contains
+                two entries with the same `name`.
+              - `builtin_actions_too_many` — `builtin_actions` exceeds
+                the per-manifest cap of 128 entries, or one entry
+                declares more than 64 parameters.
 
             Generated clients can therefore exhaustively
             switch on `code` without a fall-through arm.
@@ -5765,6 +5948,7 @@ paths:
                 detail: "plexd_hooks contains an entry whose image_digest is not a canonical sha256 digest."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/capabilities"
                 code: "plexd_hook_invalid"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "501":
           description: |
             The capability ingest surface is not yet provisioned in
@@ -5784,6 +5968,7 @@ paths:
                 detail: "PUT /v1/nodes/{id}/capabilities requires the production wiring of CapabilitiesRecorder, NSKResolver, and NodeRepo. One or more ports are not yet provisioned in this build."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/capabilities"
                 code: "capabilities_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: |
             Internal server error. Body is a `Problem` with
@@ -5940,6 +6125,7 @@ paths:
                 detail: "violations[0].kind must be one of binary_checksum, hook_checksum, ssh_host_key."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/integrity-violations"
                 code: "integrity_violation_kind_invalid"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: |
             The NSK credential in the `Authorization: Bearer` header
@@ -5966,6 +6152,7 @@ paths:
                 detail: "NSK presented in Authorization: Bearer has been revoked."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/integrity-violations"
                 code: "nsk_revoked"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "403":
           description: |
             The NSK in the `Authorization: Bearer` header authenticates
@@ -6004,6 +6191,7 @@ paths:
                 detail: "node not found."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/integrity-violations"
                 code: "integrity_violations_node_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: |
             The request is too large in bytes or in entries. The
@@ -6025,6 +6213,7 @@ paths:
                 detail: "request body exceeds the 32768-byte integrity-violations envelope cap."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/integrity-violations"
                 code: "integrity_violations_body_too_large"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: |
             Internal server error. A persistence or outbox failure that
@@ -6054,6 +6243,7 @@ paths:
                 detail: "POST /v1/nodes/{id}/integrity-violations requires the production wiring of IntegrityViolationsRecorder, NSKResolver, and NodeRepo. One or more ports are not yet provisioned in this build."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/integrity-violations"
                 code: "integrity_violations_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
   # traceability: PX-0083, REQ-001, REQ-017
   /v1/nodes/{id}/metrics:
     post:
@@ -6203,6 +6393,7 @@ paths:
                 detail: "a metric sample is missing a required field or carries a group outside the closed set."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/metrics"
                 code: "ingest_batch_malformed"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: |
             The NSK credential in the `Authorization: Bearer` header
@@ -6222,6 +6413,7 @@ paths:
                 detail: "NSK presented in Authorization: Bearer is missing or has been revoked."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/metrics"
                 code: "unauthorized"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "403":
           description: |
             The NSK authenticates successfully but belongs to a different
@@ -6260,6 +6452,7 @@ paths:
                 detail: "request body exceeds the observability ingest wire cap."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/metrics"
                 code: "ingest_body_too_large"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "415":
           description: |
             The `Content-Encoding` header names an encoding other than
@@ -6276,6 +6469,7 @@ paths:
                 detail: "Content-Encoding must be gzip or identity."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/metrics"
                 code: "ingest_encoding_unsupported"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "429":
           description: |
             A quota bucket is exhausted. The Problem body's `code` field is
@@ -6304,6 +6498,7 @@ paths:
                 detail: "per-Domain observability ingest budget exceeded; retry after the window refills."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/metrics"
                 code: "capacity_exceeded"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "501":
           description: |
             The observability ingest surface is not yet provisioned in this
@@ -6324,6 +6519,7 @@ paths:
                 detail: "POST /v1/nodes/{id}/metrics requires a configured observability ingest backend. The surface is not provisioned in this build."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/metrics"
                 code: "observability_ingest_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "503":
           description: |
             The ingest buffer could not accept the batch — the stream
@@ -6350,6 +6546,7 @@ paths:
                 detail: "the observability ingest buffer is unavailable; retry the batch shortly."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/metrics"
                 code: "ingest_buffer_unavailable"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
   # traceability: PX-0083, REQ-001, REQ-017
         "500":
           description: |
@@ -6505,6 +6702,7 @@ paths:
                 detail: "a log line is missing a required field or carries a severity outside the closed set."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/logs"
                 code: "ingest_batch_malformed"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: |
             The NSK credential in the `Authorization: Bearer` header
@@ -6524,6 +6722,7 @@ paths:
                 detail: "NSK presented in Authorization: Bearer is missing or has been revoked."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/logs"
                 code: "unauthorized"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "403":
           description: |
             The NSK authenticates successfully but belongs to a different
@@ -6562,6 +6761,7 @@ paths:
                 detail: "request body exceeds the observability ingest wire cap."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/logs"
                 code: "ingest_body_too_large"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "415":
           description: |
             The `Content-Encoding` header names an encoding other than
@@ -6578,6 +6778,7 @@ paths:
                 detail: "Content-Encoding must be gzip or identity."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/logs"
                 code: "ingest_encoding_unsupported"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "429":
           description: |
             A quota bucket is exhausted. The Problem body's `code` field is
@@ -6606,6 +6807,7 @@ paths:
                 detail: "per-Node observability ingest budget exceeded; retry after the window refills."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/logs"
                 code: "per_node_rate_limited"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "501":
           description: |
             The observability ingest surface is not yet provisioned in this
@@ -6626,6 +6828,7 @@ paths:
                 detail: "POST /v1/nodes/{id}/logs requires a configured observability ingest backend. The surface is not provisioned in this build."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/logs"
                 code: "observability_ingest_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "503":
           description: |
             The ingest buffer could not accept the batch — the stream
@@ -6652,6 +6855,7 @@ paths:
                 detail: "the observability ingest buffer is unavailable; retry the batch shortly."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/logs"
                 code: "ingest_buffer_unavailable"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
   # traceability: PX-0083, REQ-001, REQ-017
         "500":
           description: |
@@ -6805,6 +7009,7 @@ paths:
                 detail: "an audit event is missing a required field or carries a source outside the closed set."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/audit"
                 code: "ingest_batch_malformed"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: |
             The NSK credential in the `Authorization: Bearer` header
@@ -6824,6 +7029,7 @@ paths:
                 detail: "NSK presented in Authorization: Bearer is missing or has been revoked."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/audit"
                 code: "unauthorized"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "403":
           description: |
             The NSK authenticates successfully but belongs to a different
@@ -6862,6 +7068,7 @@ paths:
                 detail: "request body exceeds the observability ingest wire cap."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/audit"
                 code: "ingest_body_too_large"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "415":
           description: |
             The `Content-Encoding` header names an encoding other than
@@ -6878,6 +7085,7 @@ paths:
                 detail: "Content-Encoding must be gzip or identity."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/audit"
                 code: "ingest_encoding_unsupported"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "429":
           description: |
             A quota bucket is exhausted. The Problem body's `code` field is
@@ -6906,6 +7114,7 @@ paths:
                 detail: "per-Domain observability ingest budget exceeded; retry after the window refills."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/audit"
                 code: "capacity_exceeded"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "501":
           description: |
             The observability ingest surface is not yet provisioned in this
@@ -6926,6 +7135,7 @@ paths:
                 detail: "POST /v1/nodes/{id}/audit requires a configured observability ingest backend. The surface is not provisioned in this build."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/audit"
                 code: "observability_ingest_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "503":
           description: |
             The ingest buffer could not accept the batch — the stream
@@ -6952,6 +7162,7 @@ paths:
                 detail: "the observability ingest buffer is unavailable; retry the batch shortly."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/audit"
                 code: "ingest_buffer_unavailable"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: |
             Internal server error. Body is a `Problem` with
@@ -6963,6 +7174,10 @@ paths:
   /v1/nodes/{id}/reachability:
     get:
       operationId: GetNodeReachability
+      security:
+        - nskBearer: []
+        - sessionCookie: []
+        - operatorBearer: []
       summary: Read the reachability projection for a Node.
       description: |
         Returns the latest `Reachability` projection for the addressed
@@ -6981,6 +7196,17 @@ paths:
         authenticated callers without the relation receive 403; an
         unknown Node id surfaces as 404 only after the authorisation
         gate passes so the endpoint cannot be used as a Node-id oracle.
+
+        This read is a dual-credential surface. A node agent
+        authenticates with its NSK carried in the
+        `Authorization: Bearer` header; the NSK arm enforces an equality
+        gate — the authenticated Node must equal the addressed `{id}` —
+        and runs no ReBAC relation check. A cross-Node NSK is refused
+        with `403 node_id_mismatch` so a leaked credential cannot read a
+        sibling Node's reachability projection, and a revoked NSK is
+        refused with `401 nsk_revoked`. The operator arm (session cookie
+        or operator bearer JWT plus the `node-agent` relation on the
+        Node) is unchanged.
 
         DEFERRED-WIRING POSTURE: until the production
         composition root supplies the ReachabilityRepo, RelationChecker,
@@ -7015,16 +7241,22 @@ paths:
                 last_heartbeat_at: "2026-04-27T10:15:30Z"
                 changed_at: "2026-04-27T10:15:30Z"
         "401":
-          description: Caller is not authenticated.
+          description: |
+            Caller is not authenticated — no session cookie, operator
+            bearer JWT, or NSK resolved. On the NSK arm a missing or
+            malformed key surfaces here with `code: nsk_invalid` and a
+            revoked key with `code: nsk_revoked`.
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
         "403":
           description: |
-            Caller lacks the `node-agent` ReBAC relation on the
-            addressed Node and may not read the reachability projection.
-            The Problem body's `code` field is `insufficient_relation`.
+            Operator caller lacks the `node-agent` ReBAC relation on the
+            addressed Node and may not read the reachability projection;
+            the Problem body's `code` field is `insufficient_relation`.
+            On the NSK arm a cross-Node key surfaces here with
+            `code: node_id_mismatch`.
           content:
             application/problem+json:
               schema:
@@ -7036,6 +7268,7 @@ paths:
                 detail: "Caller lacks the node-agent relation on this Node."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/reachability"
                 code: "insufficient_relation"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "404":
           description: |
             Node id not found. Surfaced only after the authorisation
@@ -7053,6 +7286,7 @@ paths:
                 detail: "Node id not found."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/reachability"
                 code: "node_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "501":
           description: |
             The reachability surface is not yet provisioned in this
@@ -7072,6 +7306,7 @@ paths:
                 detail: "GET /v1/nodes/{id}/reachability requires the production wiring of ReachabilityRepo, RelationChecker, and NodeRepo. One or more ports are not yet provisioned in this build (see docs/architecture/mesh-event-bus-roadmap.md)."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/reachability"
                 code: "reachability_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: |
             Internal server error. Body is a `Problem` with
@@ -7164,7 +7399,7 @@ paths:
                 detail: "principal lacks the operator-action relation on the addressed Node."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/keys/rotate"
                 reason: "insufficient_relation"
-                correlation_id: "rebac-1719500000000000000"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "404":
           description: |
             Node id does not match any Node in this Domain. Surfaced
@@ -7182,6 +7417,7 @@ paths:
                 detail: "node id does not match any Node in this Domain."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/keys/rotate"
                 code: "node_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: |
             Internal server error. An authorization-check fault or a
@@ -7209,6 +7445,7 @@ paths:
                 detail: "POST /v1/nodes/{id}/keys/rotate requires the production wiring of RotationRequester and RelationChecker. One or more ports are not yet provisioned in this build."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/keys/rotate"
                 code: "node_keys_rotate_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
   /v1/nodes/{id}/keys/rotate/preview:
     get:
       operationId: GetNodeKeysRotatePreview
@@ -7307,7 +7544,7 @@ paths:
                 detail: "principal lacks the operator-action relation on the addressed Node."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/keys/rotate/preview"
                 reason: "insufficient_relation"
-                correlation_id: "rebac-1719500000000000000"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "404":
           description: |
             Node id does not match any Node in this Domain. Surfaced
@@ -7325,6 +7562,7 @@ paths:
                 detail: "node id does not match any Node in this Domain."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/keys/rotate/preview"
                 code: "node_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: |
             Internal server error. A projection-read failure or an
@@ -7352,6 +7590,270 @@ paths:
                 detail: "GET /v1/nodes/{id}/keys/rotate/preview requires the production wiring of PreviewProjection and RelationChecker. One or more ports are not yet provisioned in this build."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/keys/rotate/preview"
                 code: "node_keys_rotate_preview_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
+  /v1/nodes/{id}/peers/{peer_node_id}/psk:
+    get:
+      operationId: GetNodePeerPSK
+      security:
+        - nskBearer: []
+      summary: Fetch the pairwise edge PSK for a tunnel, rewrapped under the calling Node's NSK.
+      x-plexsphere-no-payload-logging: true
+      description: |
+        Returns the WireGuard preshared key (PSK) for the tunnel between
+        the addressed Node and the named peer, as an AES-256-GCM
+        ciphertext envelope rewrapped under the calling Node's Node
+        Secret Key (NSK). WireGuard requires the SAME preshared key on
+        both ends of a tunnel, but the control plane persists one wrapped
+        PSK per Node. The server therefore derives the per-tunnel edge
+        key from the two endpoints' stored per-Node PSKs via HKDF-SHA256
+        — both edges derive a byte-identical value — and serves it
+        rewrapped under the calling Node's NSK so that ONLY NSK-wrapped
+        ciphertext ever crosses the wire. The transient per-Node
+        plaintexts, the derived edge key, and the recovered NSK are
+        zeroed on every exit path; no plaintext is ever persisted,
+        logged, cached, or placed on the event bus.
+
+        The 200 body is the raw envelope `<12-byte nonce> ||
+        <ciphertext + 16-byte GCM tag>` — exactly 60 bytes for the
+        32-byte edge PSK — served as `application/octet-stream`. The
+        caller recovers the edge PSK byte-for-byte with
+        `AES-256-GCM-Open` under its NSK. The response carries the NSK
+        key id used for the wrap in `X-Plexsphere-PSK-KID` (so plexd can
+        pick the right NSK during a rotation overlap), the PSK epoch the
+        envelope is bound to in `X-Plexsphere-PSK-Epoch`, and
+        `Cache-Control: no-store` so no intermediary ever retains the
+        ciphertext.
+
+        An agent re-fetches the edge PSK for a peer P when P first
+        appears in a projection, when P's `public_key` changes, and after
+        the agent completes its own key rotation.
+
+        DEFERRED-WIRING POSTURE: when the edge-PSK delivery bundle is not
+        wired into the composition root every request returns 501 with
+        `code: psk_delivery_not_provisioned` so log scrapers can alert on
+        the deferred-wiring state.
+      tags:
+        - mesh
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: |
+            Node identifier (UUIDv7) of the addressed Node — the edge
+            endpoint fetching the PSK. Must equal the NSK-authenticated
+            calling Node.
+        - in: path
+          name: peer_node_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: |
+            Node identifier (UUIDv7) of the peer at the other end of the
+            edge whose pairwise PSK is fetched.
+      responses:
+        "200":
+          x-plexsphere-no-payload-logging: true
+          description: |
+            The rewrapped edge-PSK envelope `<12-byte nonce> ||
+            <ciphertext + 16-byte GCM tag>`. `AES-256-GCM-Open` under the
+            calling Node's NSK recovers the 32-byte edge PSK
+            byte-for-byte. The body is opaque ciphertext and is never
+            logged.
+          headers:
+            X-Plexsphere-PSK-KID:
+              description: |
+                The NSK key id used to wrap the envelope. Lets plexd pick
+                the correct NSK to unwrap with during a key-rotation
+                overlap window.
+              schema:
+                type: string
+              required: true
+            X-Plexsphere-PSK-Epoch:
+              description: |
+                The PSK epoch the envelope is bound to: the two endpoints'
+                PSK issuance instants, caller first, as
+                `<caller>|<peer>` in fixed-width UTC
+                (`2006-01-02T15:04:05.000000000Z`). It is part of the
+                envelope's additional authenticated data, so the agent
+                needs it to open the body at all and an attacker cannot
+                pair a replayed body with a fresher epoch.
+
+                The agent MUST refuse an envelope whose epoch is older
+                than the one already in force for that edge: the NSK is
+                not rotated by a mesh key rotation, so without this check
+                a captured envelope can be replayed to reinstall a retired
+                key. The format is fixed-width precisely so the comparison
+                is a plain string compare — byte order equals
+                chronological order.
+              schema:
+                type: string
+              required: true
+            Cache-Control:
+              description: |
+                Always `no-store` — the ciphertext envelope MUST NOT be
+                retained by any intermediary or client cache.
+              schema:
+                type: string
+              required: true
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "401":
+          description: |
+            The NSK credential in the `Authorization: Bearer` header was
+            rejected. The Problem body's `code` field disambiguates the
+            cause: `unauthorized` when the header is missing or malformed,
+            `nsk_invalid` when the presented NSK cannot be resolved, and
+            `nsk_revoked` when it resolves to a revoked NSK.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.com/errors/unauthorized"
+                title: "Unauthorized"
+                status: 401
+                detail: "NSK presented in Authorization: Bearer is missing or has been revoked."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/peers/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a6/psk"
+                code: "unauthorized"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
+        "403":
+          description: |
+            Two terminal refusals share this status, told apart by the
+            Problem body's `code` field:
+
+            - `node_id_mismatch` — the NSK authenticates but resolves to a
+              different Node than the path `id`. A Node may only fetch PSKs
+              for its own edges, so a leaked NSK cannot be replayed against
+              a sibling Node.
+            - `node_deregistered` — the NSK authenticates and matches the
+              path `id`, but the calling Node has been deregistered. This is
+              deliberately NOT one of the retryable `404` / `409` codes: an
+              agent retries those by contract, so a revoked Node routed onto
+              them would poll indefinitely instead of stopping.
+
+            The body is a plain `Problem`, not `PermissionDenied`. That is
+            the established node-facing convention — every NSK-authenticated
+            surface (state reports, observability ingest, secret fetch)
+            renders a path-id refusal through the same plain shape, because
+            the denial comes from the NSK path-binding rather than from the
+            ReBAC authorizer, so there is no traversed relation path and no
+            authorizer-emitted correlation id to report.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.com/errors/node-id-mismatch"
+                title: "Forbidden"
+                status: 403
+                detail: "resolved NSK Node id does not match URL path id."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/peers/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a6/psk"
+                code: "node_id_mismatch"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
+        "404":
+          description: |
+            The `peer_node_id` does not resolve to a live, non-deregistered
+            peer of the calling Node's Domain — also returned when
+            `peer_node_id` equals `id`, since no Node builds a tunnel to
+            itself. The Problem body's `code` field is `peer_not_found`.
+            The response deliberately does not reveal whether the target
+            exists in another Domain.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.com/errors/peer-not-found"
+                title: "Not Found"
+                status: 404
+                detail: "peer node id does not resolve to a live peer of the calling Node's Domain."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/peers/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a6/psk"
+                code: "peer_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
+        "409":
+          description: |
+            Either endpoint's live PSK row is absent because the
+            post-registration anchor consumer has not landed it yet. The
+            Problem body's `code` field is `psk_not_ready`; the agent
+            retries on its next reconcile.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.com/errors/psk-not-ready"
+                title: "Conflict"
+                status: 409
+                detail: "an endpoint PSK has not been provisioned yet; retry on the next reconcile."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/peers/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a6/psk"
+                code: "psk_not_ready"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
+        "429":
+          description: |
+            The calling Node has exhausted its per-Node edge-PSK fetch
+            budget. The Problem body's `code` field is
+            `per_node_rate_limited`. The budget is keyed on the
+            NSK-authenticated Node — not the source address, so a fleet
+            behind one NAT egress is not throttled collectively — and is
+            sized to admit a full-mesh re-fetch pass in one burst, which
+            is the largest legitimate spike the fetch-on-change contract
+            produces. The agent honours `Retry-After` and resumes.
+          headers:
+            Retry-After:
+              description: |
+                Seconds the agent should wait before retrying. The bucket
+                refills continuously, so the value is a floor that keeps a
+                well-behaved agent off a hot loop, not the exact refill
+                instant.
+              schema:
+                type: integer
+                minimum: 0
+              required: true
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.com/errors/per-node-rate-limited"
+                title: "Too Many Requests"
+                status: 429
+                detail: "per-node edge-PSK fetch rate limit exceeded."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/peers/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a6/psk"
+                code: "per_node_rate_limited"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
+        "501":
+          description: |
+            The edge-PSK delivery surface is not yet provisioned in this
+            build — the delivery bundle is unset. The Problem body's
+            `code` field is `psk_delivery_not_provisioned` so log scrapers
+            can alert on the deferred-wiring state. Resolves once the
+            edge-PSK fetch service and its ports are wired into the v1
+            handler dependency cone.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.com/errors/psk-delivery-not-provisioned"
+                title: "Not Implemented"
+                status: 501
+                detail: "GET /v1/nodes/{id}/peers/{peer_node_id}/psk requires the production wiring of the edge-PSK delivery service. The surface is not provisioned in this build."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/peers/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a6/psk"
+                code: "psk_delivery_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
   /v1/projects/{project_id}/bootstrap-tokens:
     post:
       operationId: IssueBootstrapToken
@@ -7716,9 +8218,14 @@ paths:
             RegisterRequest body parsed but failed the application-
             boundary invariant checks (e.g. an empty
             `bootstrap_token`, a zero-valued `project_id` UUID, an
-            empty `resource_id`). Distinct from 400 (which is
-            reserved for `public_key` shape failures) so operators
-            can disambiguate the two cleanly.
+            empty `resource_id`), carrying `code=invariant_violation`.
+            A `bootstrap_token` that fails the plaintext parse — it
+            misses the documented format, or its project-id segment
+            decodes to fewer than the 16 bytes a UUID needs — lands
+            here too, with `code=bootstrap_token_invalid`; no token is
+            looked up or consumed on that path. Distinct from 400
+            (which is reserved for `public_key` shape failures) so
+            operators can disambiguate the two cleanly.
           content:
             application/problem+json:
               schema:
@@ -7827,6 +8334,7 @@ paths:
                 detail: "Domain.Name must not be empty or whitespace-only "
                 instance: "/v1/domains"
                 code: "invalid_domain"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: Caller is not authenticated.
           content:
@@ -7858,6 +8366,7 @@ paths:
                 detail: "mesh_cidr 10.42.0.0/16 overlaps an existing Domain"
                 instance: "/v1/domains"
                 code: "mesh_cidr_overlap"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: |
             Request body exceeded the 8 KiB tenancy ceiling enforced by
@@ -8002,6 +8511,7 @@ paths:
                 detail: "no Domain with id 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1"
                 instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1"
                 code: "domain_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -8068,6 +8578,7 @@ paths:
                 detail: "Domain.Slug is immutable; remove the slug field from the patch body"
                 instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1"
                 code: "slug_immutable"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: Caller is not authenticated.
           content:
@@ -8122,6 +8633,7 @@ paths:
                 detail: "proposed mesh_cidr 10.43.0.0/24 invalidates project_id 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0aa sub_range 10.43.4.0/22"
                 instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1"
                 code: "mesh_cidr_invalidates_subrange"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -8202,6 +8714,7 @@ paths:
                   identities: 5
                   idp_bindings: 0
                   nodes: 3
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -8293,6 +8806,7 @@ paths:
                 detail: "Cloud endpoint payload rejected by aws validator"
                 instance: "/v1/clouds"
                 code: "invalid_cloud_endpoint"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: Caller is not authenticated.
           content:
@@ -8324,6 +8838,7 @@ paths:
                 detail: "slug acme-aws-prod is already taken"
                 instance: "/v1/clouds"
                 code: "cloud_slug_conflict"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: |
             Request body exceeded the 8 KiB Cloud Inventory ceiling
@@ -8468,6 +8983,7 @@ paths:
                 detail: "no Cloud with id 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"
                 instance: "/v1/clouds/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"
                 code: "cloud_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -8537,6 +9053,7 @@ paths:
                 detail: "Cloud.Slug is immutable; remove the slug field from the patch body"
                 instance: "/v1/clouds/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"
                 code: "slug_immutable"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: Caller is not authenticated.
           content:
@@ -8643,6 +9160,7 @@ paths:
                 cloud_child_counts:
                   cloud_credentials: 2
                   cloud_credential_usages: 1
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -8874,6 +9392,7 @@ paths:
                 detail: "no Cloud Credential with id 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1"
                 instance: "/v1/cloud-credentials/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1"
                 code: "cloud_credential_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -9337,10 +9856,10 @@ paths:
       description: |
         Returns a creation-ordered page of Credential Assignment
         lifecycle metadata for the Project identified by `{id}`. The
-        handler runs a top-level `observe` ReBAC check on the parent
-        Project BEFORE the persistence read, then layers a per-row
-        `observe` filter on top so the response items are the subset
-        of the persistence-level page the caller is authorised to see.
+        handler runs a top-level `read` ReBAC check on the parent
+        Project BEFORE the persistence read; every assignment in the
+        page belongs to the one path Project, so the project `read`
+        check authorises the whole page and no per-row filter runs.
 
         The projection carries the assignment identity, the owning
         Project, the bound Cloud Credential, the lifecycle state, a
@@ -9391,177 +9910,11 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "403":
           description: |
-            Caller is not authorized to observe the parent Project
+            Caller is not authorized to read the parent Project
             (body is a `PermissionDenied` problem) OR the pagination
             cursor was minted by a different caller and the
             per-(caller, pepper) HMAC binding rejected the replay (body
             is a `Problem` with `code = cursor_binding_mismatch`).
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "500":
-          description: Internal server error.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-  /v1/credential-assignments/{id}/approve:
-    post:
-      operationId: ApproveCredentialAssignment
-      summary: Approve a Credential Assignment.
-      description: |
-        Approves the Credential Assignment identified by `{id}`. The
-        handler reads the row to resolve the parent Project, runs the
-        `manage` ReBAC check on that Project, then delegates to the
-        Credential Assignment application service which moves the
-        assignment to the `approved` state, materialises the binding,
-        and appends a `CredentialAssignmentApproved` outbox event in a
-        single transaction.
-
-        Approval is only legal from the `requested` state — any other
-        source state returns `409 illegal_transition`. The caller may
-        not approve an assignment they themselves requested; that
-        self-approval is rejected with `403 self_approval_denied`.
-      tags:
-        - cloud
-      parameters:
-        - $ref: "#/components/parameters/CredentialAssignmentID"
-      responses:
-        "200":
-          description: |
-            Credential Assignment approved. Body is the metadata
-            projection with `state: approved` and `materialised: true`.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/CredentialAssignmentResponse"
-        "400":
-          description: |
-            Malformed id. Body is a `Problem` with
-            `code: invalid_credential_assignment_id`.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "401":
-          description: Caller is not authenticated.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "403":
-          description: |
-            Caller is not authorized to manage the parent Project, or
-            the caller is the requester of this assignment and may not
-            approve their own request (body is a `Problem` with
-            `code: self_approval_denied`).
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/PermissionDenied"
-        "404":
-          description: |
-            Credential Assignment not found. Body is a `Problem` with
-            `code: credential_assignment_not_found`.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "409":
-          description: |
-            The assignment is not in a state from which approval is
-            legal. Body is a `Problem` with `code: illegal_transition`.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "500":
-          description: Internal server error.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-  /v1/credential-assignments/{id}/reject:
-    post:
-      operationId: RejectCredentialAssignment
-      summary: Reject a Credential Assignment.
-      description: |
-        Rejects the Credential Assignment identified by `{id}`. The
-        handler reads the row to resolve the parent Project, runs the
-        `manage` ReBAC check on that Project, then delegates to the
-        Credential Assignment application service which moves the
-        assignment to the `rejected` state and appends a
-        `CredentialAssignmentRejected` outbox event in a single
-        transaction. The `reason` from the body is recorded on the
-        event as an approver-supplied audit string.
-
-        Rejection is only legal from the `requested` state — any other
-        source state returns `409 illegal_transition`.
-      tags:
-        - cloud
-      parameters:
-        - $ref: "#/components/parameters/CredentialAssignmentID"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CredentialAssignmentDecisionRequest"
-            example:
-              reason: "Cloud Credential is scheduled for rotation this week"
-      responses:
-        "200":
-          description: |
-            Credential Assignment rejected. Body is the metadata
-            projection with `state: rejected`.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/CredentialAssignmentResponse"
-        "400":
-          description: |
-            Malformed id or body. Body is a `Problem` with `code` ∈
-            { `invalid_credential_assignment_id`, `invalid_body`,
-            `invalid_decision_reason` }.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "401":
-          description: Caller is not authenticated.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "403":
-          description: |
-            Caller is not authorized to manage the parent Project.
-            Body is a `PermissionDenied` problem.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/PermissionDenied"
-        "404":
-          description: |
-            Credential Assignment not found. Body is a `Problem` with
-            `code: credential_assignment_not_found`.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "409":
-          description: |
-            The assignment is not in a state from which rejection is
-            legal. Body is a `Problem` with `code: illegal_transition`.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "413":
-          description: |
-            Request body exceeded the 8 KiB ceiling. Body is a `Problem`
-            with `code: request_body_too_large`.
           content:
             application/problem+json:
               schema:
@@ -9578,13 +9931,21 @@ paths:
       summary: Revoke a Credential Assignment.
       description: |
         Revokes the Credential Assignment identified by `{id}`. The
-        handler reads the row to resolve the parent Project, runs the
-        `manage` ReBAC check on that Project, then delegates to the
-        Credential Assignment application service which moves the
-        assignment to the `revoked` state, tears down the materialised
-        binding, and appends a `CredentialAssignmentRevoked` outbox
-        event in a single transaction. The `reason` from the body is
-        recorded on the event as an operator-supplied audit string.
+        handler reads the row to resolve the owning Cloud Credential and
+        the consuming Project, runs the dual ReBAC gate described below,
+        then delegates to the Credential Assignment application service
+        which moves the assignment to the `revoked` state, tears down
+        the materialised binding, and appends a
+        `CredentialAssignmentRevoked` outbox event in a single
+        transaction. The `reason` from the body is recorded on the event
+        as an operator-supplied audit string.
+
+        The gate has two legs: `assign` on the owning Cloud Credential,
+        the object the assignment spends, and on its denial `deploy` on
+        the consuming Project. Either leg authorises the revocation; the
+        call is denied only when both deny. The second leg lets a
+        Project owner hand back a Credential they were granted without
+        holding the Credential-side `assign` relation.
 
         Revocation is only legal from the `approved` state — any other
         source state returns `409 illegal_transition`.
@@ -9626,8 +9987,9 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "403":
           description: |
-            Caller is not authorized to manage the parent Project.
-            Body is a `PermissionDenied` problem.
+            Caller holds neither `assign` on the owning Cloud Credential
+            nor `deploy` on the consuming Project. Body is a
+            `PermissionDenied` problem.
           content:
             application/problem+json:
               schema:
@@ -9901,186 +10263,27 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
-  /v1/cloud-assignments/{id}/approve:
-    post:
-      operationId: ApproveCloudAssignment
-      summary: Approve a Cloud Assignment request.
-      description: |
-        Approves the Cloud Assignment identified by `{id}`. The handler
-        reads the row to resolve the owning Cloud, runs the `assign`
-        ReBAC check on that Cloud, then delegates to the Cloud
-        Assignment application service which moves the assignment to the
-        `approved` state, materialises the `cloud#uses` binding so the
-        Cloud is usable in the Project, and appends a
-        `CloudAssignmentMaterialised` outbox event in a single
-        transaction.
-
-        Approval is only legal from the `requested` state — any other
-        source state returns `409 illegal_transition`. The caller may
-        not approve an assignment they themselves requested; that
-        self-approval is rejected with `403 self_approval_denied`.
-      tags:
-        - cloud
-      parameters:
-        - $ref: "#/components/parameters/CloudAssignmentID"
-      responses:
-        "200":
-          description: |
-            Cloud Assignment approved. Body is the metadata projection
-            with `state: approved` and `materialised: true`.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/CloudAssignmentResponse"
-        "400":
-          description: |
-            Malformed id. Body is a `Problem` with
-            `code: invalid_cloud_assignment_id`.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "401":
-          description: Caller is not authenticated.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "403":
-          description: |
-            Caller is not authorized to assign the owning Cloud, or the
-            caller is the requester of this assignment and may not
-            approve their own request (body is a `Problem` with
-            `code: self_approval_denied`).
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/PermissionDenied"
-        "404":
-          description: |
-            Cloud Assignment not found. Body is a `Problem` with
-            `code: cloud_assignment_not_found`.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "409":
-          description: |
-            The assignment is not in a state from which approval is
-            legal. Body is a `Problem` with `code: illegal_transition`.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "500":
-          description: Internal server error.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-  /v1/cloud-assignments/{id}/reject:
-    post:
-      operationId: RejectCloudAssignment
-      summary: Reject a Cloud Assignment request.
-      description: |
-        Rejects the Cloud Assignment identified by `{id}`. The handler
-        reads the row to resolve the owning Cloud, runs the `assign`
-        ReBAC check on that Cloud, then delegates to the Cloud
-        Assignment application service which moves the assignment to the
-        `rejected` state and appends a `CloudAssignmentRejected` outbox
-        event in a single transaction. The `reason` from the body is
-        recorded on the event as an operator-supplied audit string.
-
-        Rejection is only legal from the `requested` state — any other
-        source state returns `409 illegal_transition`.
-      tags:
-        - cloud
-      parameters:
-        - $ref: "#/components/parameters/CloudAssignmentID"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CloudAssignmentDecisionRequest"
-            example:
-              reason: "Cloud is being decommissioned this quarter"
-      responses:
-        "200":
-          description: |
-            Cloud Assignment rejected. Body is the metadata projection
-            with `state: rejected`.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/CloudAssignmentResponse"
-        "400":
-          description: |
-            Malformed id or body. Body is a `Problem` with `code` ∈
-            { `invalid_cloud_assignment_id`, `invalid_body`,
-            `invalid_decision_reason` }.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "401":
-          description: Caller is not authenticated.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "403":
-          description: |
-            Caller is not authorized to assign the owning Cloud.
-            Body is a `PermissionDenied` problem.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/PermissionDenied"
-        "404":
-          description: |
-            Cloud Assignment not found. Body is a `Problem` with
-            `code: cloud_assignment_not_found`.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "409":
-          description: |
-            The assignment is not in a state from which rejection is
-            legal. Body is a `Problem` with `code: illegal_transition`.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "413":
-          description: |
-            Request body exceeded the 8 KiB ceiling. Body is a `Problem`
-            with `code: request_body_too_large`.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "500":
-          description: Internal server error.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
   /v1/cloud-assignments/{id}/revoke:
     post:
       operationId: RevokeCloudAssignment
       summary: Revoke a Cloud Assignment.
       description: |
         Revokes the Cloud Assignment identified by `{id}`. The handler
-        reads the row to resolve the owning Cloud, runs the `assign`
-        ReBAC check on that Cloud, then delegates to the Cloud
-        Assignment application service which moves the assignment to the
-        `revoked` state, narrow-deletes the `cloud#uses` binding so the
-        Cloud is no longer usable in the Project, and appends a
-        `CloudAssignmentRevoked` outbox event in a single transaction.
-        The `reason` from the body is recorded on the event as an
-        operator-supplied audit string.
+        reads the row to resolve the owning Cloud and the consuming
+        Project, runs the dual ReBAC gate described below, then
+        delegates to the Cloud Assignment application service which
+        moves the assignment to the `revoked` state, narrow-deletes the
+        `cloud#uses` binding so the Cloud is no longer usable in the
+        Project, and appends a `CloudAssignmentRevoked` outbox event in
+        a single transaction. The `reason` from the body is recorded on
+        the event as an operator-supplied audit string.
+
+        The gate has two legs: `assign` on the owning Cloud, the object
+        the assignment spends, and on its denial `deploy` on the
+        consuming Project. Either leg authorises the revocation; the
+        call is denied only when both deny. The second leg lets a
+        Project owner hand back a Cloud they were granted without
+        holding the Cloud-side `assign` relation.
 
         Revocation is only legal from the `approved` state — any other
         source state returns `409 illegal_transition`.
@@ -10122,8 +10325,9 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "403":
           description: |
-            Caller is not authorized to assign the owning Cloud.
-            Body is a `PermissionDenied` problem.
+            Caller holds neither `assign` on the owning Cloud nor
+            `deploy` on the consuming Project. Body is a
+            `PermissionDenied` problem.
           content:
             application/problem+json:
               schema:
@@ -10163,18 +10367,31 @@ paths:
       operationId: ListApprovals
       summary: List dual-control Approvals.
       description: |
-        Returns a creation-ordered page of Approval lifecycle metadata
-        across the approval queue, optionally narrowed to a single
-        lifecycle `status` and/or a single owning `domain_id`. The
-        handler runs the approval-read ReBAC check BEFORE the
-        persistence read, then layers a per-row visibility filter on
-        top so the response items are the subset of the persistence-
-        level page the caller is authorised to see.
+        Returns a creation-ordered page of approval-queue rows. The
+        queue is the union of three sources: generic Approvals,
+        Credential Assignments, and Cloud Assignments. Every row carries
+        a `kind` naming its source. The page is optionally narrowed to a
+        single lifecycle `status`, a single owning `domain_id`, a single
+        source `kind`, and a single `cloud_id`.
 
-        The projection carries the proposal identity, the owning Domain,
-        the proposer, the proposed action and target, the lifecycle
-        state, the decision metadata once a terminal state is reached,
-        and the names-only audit caveat projection.
+        There is no top-level ReBAC gate on this operation: any
+        authenticated principal may call it, and per-row fail-closed
+        checks decide what the page contains. An `approval` row is
+        visible to a caller holding `read` on its owning Domain; an
+        assignment row is visible to a caller holding `assign` on the
+        object it spends, the Cloud Credential for a
+        `credential_assignment` and the Cloud for a `cloud_assignment`.
+        A row whose check errors or denies is dropped from the page, so
+        the `items` array is the subset the caller is authorised to see.
+
+        The projection carries the row identity and kind, the owning
+        Domain, the consuming Project on assignment rows, the proposer,
+        the proposed action and target, the lifecycle state, the
+        decision metadata once a terminal state is reached, and the
+        names-only audit caveat projection. An assignment row presents
+        its stored `requested` state as the wire state
+        `pending-approval` so a client filters the whole queue with one
+        vocabulary.
 
         The pagination cursor is HMAC-signed and bound to the
         per-(caller, pepper) pseudonym, so a cursor minted by one
@@ -10190,8 +10407,18 @@ paths:
           schema:
             $ref: "#/components/schemas/ApprovalState"
           description: |
-            Optional lifecycle filter. When present, only Approvals in
-            the named state are returned.
+            Optional lifecycle filter. When present, only rows in the
+            named state are returned. A value outside the vocabulary is
+            rejected with `400 invalid_status`.
+        - in: query
+          name: kind
+          required: false
+          schema:
+            $ref: "#/components/schemas/ApprovalKind"
+          description: |
+            Optional source filter. When present, only rows of the named
+            source family are returned. A value outside the vocabulary
+            is rejected with `400 invalid_kind`.
         - in: query
           name: domain_id
           required: false
@@ -10199,8 +10426,23 @@ paths:
             type: string
             format: uuid
           description: |
-            Optional owning-Domain filter. When present, only Approvals
+            Optional owning-Domain filter. When present, only rows
             belonging to the named Domain are returned.
+        - in: query
+          name: cloud_id
+          required: false
+          schema:
+            type: string
+            format: uuid
+          description: |
+            Optional Cloud filter. When present, only assignment rows
+            that target the named Cloud are returned: a
+            `cloud_assignment` row for that Cloud, or a
+            `credential_assignment` row for any Cloud Credential the
+            Cloud owns. An `approval` row never matches this filter, so
+            combining `cloud_id` with `kind=approval` returns an empty
+            page. A malformed value is rejected with
+            `400 invalid_cloud_id`.
         - $ref: "#/components/parameters/Cursor"
         - $ref: "#/components/parameters/Limit"
       responses:
@@ -10213,6 +10455,7 @@ paths:
               example:
                 items:
                   - id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1"
+                    kind: "approval"
                     domain_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1"
                     proposer_subject: "user:alice"
                     action_kind: "cloud.credential.rotate"
@@ -10221,12 +10464,26 @@ paths:
                     state: "pending-approval"
                     created_at: "2026-05-02T10:00:00Z"
                     expires_at: "2026-05-03T10:00:00Z"
+                  - id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2"
+                    kind: "cloud_assignment"
+                    domain_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1"
+                    project_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"
+                    proposer_subject: "user:bob"
+                    action_kind: "cloud.assignment.request"
+                    target_resource: "cloud:0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c2"
+                    state: "pending-approval"
+                    materialised: false
+                    created_at: "2026-05-02T10:30:00Z"
                 next_cursor: "eyJjIjoiMDE5MGE4YjgifQ.signed"
         "400":
           description: |
             Invalid query parameters — typically a tampered or
-            malformed cursor, an out-of-range `limit`, or a malformed
-            `domain_id` filter.
+            malformed cursor, an out-of-range `limit`, a malformed
+            `domain_id` or `cloud_id` filter, or a `status` / `kind`
+            value outside its vocabulary. Body is a `Problem` with
+            `code` ∈ { `invalid_cursor`, `invalid_limit`,
+            `invalid_domain_id`, `invalid_cloud_id`, `invalid_status`,
+            `invalid_kind` }.
           content:
             application/problem+json:
               schema:
@@ -10239,11 +10496,13 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "403":
           description: |
-            Caller is not authorized to read the approval queue (body is
-            a `PermissionDenied` problem) OR the pagination cursor was
-            minted by a different caller and the per-(caller, pepper)
-            HMAC binding rejected the replay (body is a `Problem` with
-            `code = cursor_binding_mismatch`).
+            The pagination cursor was minted by a different caller and
+            the per-(caller, pepper) HMAC binding rejected the replay.
+            Body is a `Problem` with
+            `code = cursor_binding_mismatch`. Lacking permission is NOT
+            a `403` here: the operation has no top-level gate, and a
+            caller authorised for nothing receives `200` with an empty
+            `items` array.
           content:
             application/problem+json:
               schema:
@@ -10259,9 +10518,20 @@ paths:
       operationId: GetApproval
       summary: Inspect a single Approval.
       description: |
-        Returns the lifecycle metadata projection of the Approval
-        identified by `{id}`. The handler runs the approval-read ReBAC
-        check on the owning Domain BEFORE the persistence read.
+        Returns the lifecycle metadata projection of the queue row
+        identified by `{id}`. The row may come from any of the three
+        queue sources, and its `kind` names which one.
+
+        The visibility check is the same per-row, fail-closed check
+        `ListApprovals` applies, resolved once the row read has revealed
+        the kind: `read` on the owning Domain for an `approval` row,
+        `assign` on the Cloud Credential for a `credential_assignment`
+        row, `assign` on the Cloud for a `cloud_assignment` row.
+
+        An assignment row presents its stored `requested` state as the
+        wire state `pending-approval`, and carries `project_id` and
+        `materialised` in place of the `expires_at` deadline an
+        `approval` row carries.
       tags:
         - approvals
       parameters:
@@ -10314,16 +10584,20 @@ paths:
       operationId: ApproveApproval
       summary: Approve a pending Approval.
       description: |
-        Approves the Approval identified by `{id}`. The handler reads
-        the row to resolve the owning Domain, runs the `approve` ReBAC
-        check on that Domain, then delegates to the approval-workflow
-        application service which moves the proposal to the `approved`
-        state and appends the approval outbox event in a single
-        transaction.
+        Approves the queue row identified by `{id}`. This is the one
+        approve entry point for all three queue sources: the handler
+        reads the row, then dispatches on its `kind` to the owning
+        application service. The gate is the one the kind's source
+        surface owns: `approve` on the owning Domain for an `approval`
+        row, `assign` on the Cloud Credential for a
+        `credential_assignment` row, `assign` on the Cloud for a
+        `cloud_assignment` row.
 
         Approval is only legal from the `pending-approval` state (or the
         `proposed` state under the empty-policy short-circuit) — any
-        other source state returns `409 illegal_transition`. The caller
+        other source state returns `409 illegal_transition`. On an
+        assignment row `pending-approval` is the wire presentation of
+        the stored `requested` state, so the same rule holds. The caller
         may not approve a proposal they themselves raised; that
         self-approval is rejected with `403 self_approval_denied`.
       tags:
@@ -10355,9 +10629,11 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "403":
           description: |
-            Caller is not authorized to approve in the owning Domain, or
-            the caller is the proposer of this proposal and may not
-            approve their own request (body is a `Problem` with
+            Caller is not authorized to decide a row of this kind
+            (`approve` on the owning Domain, or `assign` on the Cloud
+            Credential or Cloud the assignment spends), or the caller is
+            the proposer of this proposal and may not approve their own
+            request (body is a `Problem` with
             `code: self_approval_denied`).
           content:
             application/problem+json:
@@ -10390,16 +10666,22 @@ paths:
       operationId: RejectApproval
       summary: Reject a pending Approval.
       description: |
-        Rejects the Approval identified by `{id}`. The handler reads the
-        row to resolve the owning Domain, runs the `approve` ReBAC check
-        on that Domain, then delegates to the approval-workflow
-        application service which moves the proposal to the `rejected`
-        state and appends the rejection outbox event in a single
-        transaction. The `reason` from the body is recorded on the
-        decision as an operator-supplied audit string.
+        Rejects the queue row identified by `{id}`. This is the one
+        reject entry point for all three queue sources: the handler
+        reads the row, then dispatches on its `kind` to the owning
+        application service, which moves the row to the `rejected` state
+        and appends the rejection outbox event in a single transaction.
+        The gate is the one the kind's source surface owns: `approve` on
+        the owning Domain for an `approval` row, `assign` on the Cloud
+        Credential for a `credential_assignment` row, `assign` on the
+        Cloud for a `cloud_assignment` row. The `reason` from the body
+        is recorded on the decision as an operator-supplied audit
+        string.
 
         Rejection is only legal from the `pending-approval` state — any
-        other source state returns `409 illegal_transition`.
+        other source state returns `409 illegal_transition`. On an
+        assignment row `pending-approval` is the wire presentation of
+        the stored `requested` state, so the same rule holds.
       tags:
         - approvals
       parameters:
@@ -10438,8 +10720,10 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "403":
           description: |
-            Caller is not authorized to decide in the owning Domain.
-            Body is a `PermissionDenied` problem.
+            Caller is not authorized to decide a row of this kind
+            (`approve` on the owning Domain, or `assign` on the Cloud
+            Credential or Cloud the assignment spends). Body is a
+            `PermissionDenied` problem.
           content:
             application/problem+json:
               schema:
@@ -10494,6 +10778,13 @@ paths:
         field NAME only on the decision's audit caveat context; the
         value itself is PII routed to a PII-safe sink and never crosses
         the contract boundary.
+
+        Break-glass covers the `approval` kind only. The emergency
+        override is a Domain `ApprovalPolicy` construct and the
+        assignment sources have no counterpart, so a
+        `credential_assignment` or `cloud_assignment` row answers
+        `409 illegal_transition`. Decide those rows through
+        `ApproveApproval` or `RejectApproval`.
       tags:
         - approvals
       parameters:
@@ -10549,7 +10840,9 @@ paths:
         "409":
           description: |
             The proposal is not in a state from which the override is
-            legal. Body is a `Problem` with `code: illegal_transition`.
+            legal, or the row is of an assignment kind, which has no
+            emergency override. Body is a `Problem` with
+            `code: illegal_transition`.
           content:
             application/problem+json:
               schema:
@@ -10709,6 +11002,7 @@ paths:
                 detail: "no credential with id 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1"
                 instance: "/v1/credentials/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1"
                 code: "credential_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -10995,6 +11289,7 @@ paths:
                 detail: "slug managed-postgres is already taken"
                 instance: "/v1/blueprints"
                 code: "blueprint_slug_conflict"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: |
             Request body exceeded the Blueprint authorship ceiling
@@ -11163,6 +11458,7 @@ paths:
                 detail: "no Blueprint with id 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1"
                 instance: "/v1/blueprints/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1"
                 code: "blueprint_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -11297,6 +11593,7 @@ paths:
                 detail: "version 1.0.0 already published"
                 instance: "/v1/blueprints/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e1/versions"
                 code: "blueprint_version_exists"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: |
             Request body exceeded the Blueprint authorship ceiling
@@ -11857,6 +12154,7 @@ paths:
                 detail: "origin must be one of: adopted, provisioned"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1/resources"
                 code: "invalid_resource_origin"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: Caller is not authenticated.
           content:
@@ -12033,6 +12331,7 @@ paths:
                 detail: "no Resource with id 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1"
                 instance: "/v1/resources/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1"
                 code: "resource_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -12560,6 +12859,7 @@ paths:
                 detail: "Project.Name must not be empty or whitespace-only "
                 instance: "/v1/projects"
                 code: "invalid_project"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: Caller is not authenticated.
           content:
@@ -12593,6 +12893,7 @@ paths:
                 detail: "sub_range_cidr 10.42.4.0/22 overlaps an existing Project's reservation"
                 instance: "/v1/projects"
                 code: "sub_range_overlap"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: |
             Request body exceeded the 8 KiB tenancy ceiling enforced
@@ -12747,6 +13048,7 @@ paths:
                 detail: "no Project with id 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0aa"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0aa"
                 code: "project_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -12809,6 +13111,7 @@ paths:
                 detail: "Project.Slug is immutable; remove the slug field from the patch body"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0aa"
                 code: "slug_immutable"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: Caller is not authenticated.
           content:
@@ -12864,6 +13167,7 @@ paths:
                 detail: "proposed sub_range 10.42.8.0/22 overlaps existing project_id 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0bb sub_range 10.42.8.0/24"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0aa"
                 code: "sub_range_invalidates_allocation"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -12943,6 +13247,7 @@ paths:
                   resources: 2
                   nodes: 1
                   relation_tuples: 3
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -13022,6 +13327,7 @@ paths:
                 detail: "kind query parameter must be one of {user, service-identity}"
                 instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1/identities"
                 code: "invalid_kind"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: Caller is not authenticated.
           content:
@@ -13104,6 +13410,7 @@ paths:
                 detail: "principalId path parameter must be a non-zero UUIDv7"
                 instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1/identities/zz"
                 code: "invalid_principal_id"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: Caller is not authenticated.
           content:
@@ -13133,6 +13440,7 @@ paths:
                 detail: "no principal with id 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1 in this Domain"
                 instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1/identities/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1"
                 code: "identity_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -13215,6 +13523,7 @@ paths:
                 detail: "federation_kind must be one of {oidc_cc, spiffe_svid, api_token}"
                 instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1/service-identities"
                 code: "invalid_service_identity"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: Caller is not authenticated.
           content:
@@ -13245,6 +13554,7 @@ paths:
                 detail: "a service identity with this subject already exists in the Domain"
                 instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1/service-identities"
                 code: "service_identity_already_exists"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: Request body exceeded the size cap.
           content:
@@ -13385,6 +13695,7 @@ paths:
                 detail: "a pending invitation already exists for this (domain, external_subject); existing id 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c0"
                 instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1/invitations"
                 code: "invitation_already_pending"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: |
             Request body exceeded the 8 KiB tenancy ceiling enforced
@@ -13411,6 +13722,7 @@ paths:
                 detail: "initial_tuples[0].object must be domain:<this-id>, project:<uuid>, or group:<uuid>"
                 instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1/invitations"
                 code: "invitation_object_out_of_scope"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -13506,6 +13818,7 @@ paths:
                 detail: "status query parameter must be one of {pending, accepted, revoked, expired, all}"
                 instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1/invitations"
                 code: "invalid_status"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: Caller is not authenticated.
           content:
@@ -13604,6 +13917,7 @@ paths:
                 detail: "no invitation with id 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1 in this Domain"
                 instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1/invitations/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"
                 code: "invitation_not_found"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -13690,6 +14004,7 @@ paths:
                 detail: "invitation 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1 has already been accepted"
                 instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1/invitations/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"
                 code: "invitation_already_accepted"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -14244,6 +14559,7 @@ paths:
                 detail: "GET /v1/domains/{domain_id}/mesh/topology requires the production wiring of TopologyProjection and RelationChecker. One or more ports are not yet provisioned in this build."
                 instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/mesh/topology"
                 code: mesh_topology_not_provisioned
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
   /v1/domains/{domain_id}/capacity:
     get:
       operationId: GetDomainCapacity
@@ -14386,6 +14702,7 @@ paths:
                 detail: "the capacity collector has not produced a snapshot for this Domain yet; retry after the next sample."
                 instance: "/v1/domains/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/capacity"
                 code: "capacity_snapshot_unavailable"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
   # traceability: PX-0090, S065 — opt-in PlexdHook managed-push surface.
   # DECISION: the rollback action is modelled as a `/rollback` sub-path
   # POST rather than a PATCH on a `status` field of the push resource.
@@ -15957,7 +16274,10 @@ paths:
         the named Project. Each row pairs a Node's reported agent binary
         with a checksum status — `match` when the reported checksum
         equals a known-good artifact, `drift` when it differs, and
-        `unknown` when no known-good artifact is on record. The handler
+        `unknown` when no known-good artifact is on record — and carries
+        the built-in action inventory the Node's agent advertised, so a
+        caller can answer what a Node can do without dispatching
+        anything. The handler
         runs the platform read gate before the persistence read, then
         layers a per-row visibility filter on the Domain owning each
         Node so `items` is the subset the caller is authorised to see.
@@ -16012,6 +16332,20 @@ paths:
                     binary_version: "plexd-v0.4.2-ge5f3a1c"
                     binary_checksum: "XohImNooBHFR0OVvjcYpJ3NgPQ1qq73WKhHvch0VQtg="
                     status: "match"
+                    # The parameter `default` key is omitted here for the same
+                    # reason it is omitted from the capability-manifest example
+                    # — see the DECISION note on BuiltinActionParameter.default.
+                    builtin_actions:
+                      - name: "diagnostics.collect"
+                        description: "Collect a diagnostics bundle from the node."
+                        parameters:
+                          - name: "since"
+                            type: "duration"
+                            required: false
+                            description: "How far back to collect logs."
+                      - name: "service.upgrade"
+                        description: "Upgrade the plexd binary to a target version."
+                        parameters: []
                     reported_at: "2026-05-02T10:00:00Z"
         "400":
           description: |
@@ -16447,6 +16781,7 @@ paths:
                 detail: "listen_port must be in the range 1..65535"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1/resources/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2/bridge/relay"
                 code: "port_out_of_range"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: Caller is not authenticated.
           content:
@@ -16490,6 +16825,7 @@ paths:
                 detail: "the addressed Resource is not of kind bridge"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1/resources/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2/bridge/relay"
                 code: "resource_not_bridge"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: |
             Request body exceeded the bridge body ceiling.
@@ -16565,6 +16901,7 @@ paths:
                 detail: "auth_secret_ref must match secret:<domain>/<project>/<name>(:<version>)?"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1/resources/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2/bridge/user-access"
                 code: "secret_ref_malformed"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: Caller is not authenticated.
           content:
@@ -16609,6 +16946,7 @@ paths:
                 detail: "a user-access provider with slug field-team already exists on this Resource"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1/resources/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2/bridge/user-access"
                 code: "slug_conflict"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: |
             Request body exceeded the bridge body ceiling.
@@ -16800,6 +17138,7 @@ paths:
                 detail: "listen_port 51820 is already in use by a sibling aggregate within the bridge"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1/resources/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2/bridge/user-access/field-team"
                 code: "bridge_port_conflict"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: |
             Request body exceeded the bridge body ceiling.
@@ -16925,6 +17264,7 @@ paths:
                 detail: "target_node_id resolves to a Node outside the bridge Resource's Domain"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1/resources/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2/bridge/ingress"
                 code: "target_node_not_in_domain"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: Caller is not authenticated.
           content:
@@ -16969,6 +17309,7 @@ paths:
                 detail: "target_node_id 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e3 target_port 8443 is already claimed by a sibling ingress rule within the bridge"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1/resources/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2/bridge/ingress"
                 code: "bridge_port_conflict"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: |
             Request body exceeded the bridge body ceiling.
@@ -16996,6 +17337,7 @@ paths:
                 detail: "the ACME directory for the configured acme_account_ref is unreachable"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1/resources/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2/bridge/ingress"
                 code: "acme_directory_unreachable"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -17181,6 +17523,7 @@ paths:
                 detail: "target_node_id 0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0e3 target_port 8443 is already claimed by a sibling ingress rule within the bridge"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1/resources/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2/bridge/ingress/public-api"
                 code: "bridge_port_conflict"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: |
             Request body exceeded the bridge body ceiling.
@@ -17208,6 +17551,7 @@ paths:
                 detail: "the ACME directory for the configured acme_account_ref is unreachable"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1/resources/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2/bridge/ingress/public-api"
                 code: "acme_directory_unreachable"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -17328,6 +17672,7 @@ paths:
                 detail: "allowed_subnets must list at least one CIDR prefix"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1/resources/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2/bridge/site-to-site"
                 code: "allowed_subnet_empty"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "401":
           description: Caller is not authenticated.
           content:
@@ -17374,6 +17719,7 @@ paths:
                 detail: "allowed_subnet 10.99.42.0/24 overlaps the domain mesh CIDR 10.99.0.0/16"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1/resources/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2/bridge/site-to-site"
                 code: "subnet_overlap_with_mesh"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: |
             Request body exceeded the bridge body ceiling.
@@ -17567,6 +17913,7 @@ paths:
                 detail: "allowed_subnet 10.20.0.0/16 overlaps a sibling tunnel within the bridge"
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1/resources/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d2/bridge/site-to-site/dc-east"
                 code: "subnet_overlap_with_tunnel"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "413":
           description: |
             Request body exceeded the bridge body ceiling.
@@ -17784,6 +18131,7 @@ paths:
                 detail: "POST /v1/projects/{project_id}/executions/dispatch requires the production wiring of the dispatch service. One or more ports are not yet provisioned in this build."
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1/executions/dispatch"
                 code: "actions_dispatch_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -18125,6 +18473,7 @@ paths:
                 detail: "POST /v1/nodes/{id}/executions/{execution_id} requires the production wiring of the callback service and its NSK validator. One or more ports are not yet provisioned in this build."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/executions/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1"
                 code: "execution_callback_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -18218,6 +18567,7 @@ paths:
                 detail: "GET /v1/projects/{project_id}/secrets requires the production wiring of the secret-inventory read service. One or more ports are not yet provisioned in this build."
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1/secrets"
                 code: "secrets_inventory_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -18273,9 +18623,11 @@ paths:
         "201":
           description: |
             Session issued. Body carries the metadata-only Session
-            projection, the signed EdDSA JWT (delivered exactly once), the
-            per-kind plexd listener endpoint, and the expiry. The
-            `Location` header points at the single-Session read path.
+            projection, the signed EdDSA JWT (delivered exactly once), and
+            the expiry. It carries no listener endpoint: the endpoint
+            settles on the Session read projection once the target Node
+            reports it. The `Location` header points at the single-Session
+            read path.
           headers:
             Location:
               description: |
@@ -18291,7 +18643,6 @@ paths:
                 session_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2"
                 token: "eyJhbGciOiJFZERTQSIsInR5cCI6ImF0K2p3dCIsImtpZCI6ImQwMSJ9.eyJqdGkiOiIwMTkwYThiOCJ9.sig"
                 expires_at: "2026-05-02T10:30:00Z"
-                listener_endpoint: "100.64.0.12:2200"
                 session:
                   id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2"
                   project_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1"
@@ -18410,6 +18761,7 @@ paths:
                 detail: "the signing backend is temporarily unavailable; retry shortly."
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1/sessions"
                 code: "signing_unavailable"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "501":
           description: |
             The access-orchestrator surface is not yet provisioned in this
@@ -18429,6 +18781,7 @@ paths:
                 detail: "POST /v1/projects/{project_id}/sessions requires the production wiring of the access-orchestrator service. One or more ports are not yet provisioned in this build."
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1/sessions"
                 code: "access_session_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -18629,9 +18982,12 @@ paths:
         mediated SSH session identified by `{session_id}` within the owning
         Project. The handler re-runs the issuance-equivalent ReBAC check on
         the session's Resource BEFORE dialing anything, validates the Session
-        is `active` and `ssh`-kind, then dials the target plexd
-        `listener_endpoint` over the mesh and copies bytes bidirectionally
-        between the client socket and the mesh connection.
+        is `active` and `ssh`-kind, then dials the `listener_endpoint` the
+        target Node reported for the Session over the mesh and copies bytes
+        bidirectionally between the client socket and the mesh connection.
+        The reported endpoint is the only dial target: a Session whose Node
+        has not reported one yet is refused with 409
+        `session_listener_pending` instead of being dialed.
 
         This operation does NOT speak JSON. On a successful upgrade the
         response is `101 Switching Protocols` and the connection body is an
@@ -18686,8 +19042,10 @@ paths:
             with `code` ∈ { `session_not_active` (the Session is revoked,
             expired, or otherwise not live), `session_not_ssh` (the Session
             is `k8s`- or `tcp`-kind — only the `ssh` kind has a browser
-            terminal) }. The gateway rejects with this status BEFORE any
-            mesh dial is attempted.
+            terminal), `session_listener_pending` (the Session is live, but
+            its target Node has not reported a `listener_endpoint` yet;
+            retry after the Node's next reconcile) }. The gateway rejects
+            with this status BEFORE any mesh dial is attempted.
           content:
             application/problem+json:
               schema:
@@ -18728,6 +19086,7 @@ paths:
                 detail: "GET /v1/projects/{project_id}/sessions/{session_id}/attach requires the production wiring of the session-lookup and mesh-dialer ports. One or more ports are not yet provisioned in this build."
                 instance: "/v1/projects/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1/sessions/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2/attach"
                 code: "access_attach_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -18839,6 +19198,13 @@ paths:
              pair — the TCP shape is deliberately payload-blind, with no
              L7 parsing.
 
+        A `tcp` `session_started` row may carry a `listener_endpoint`, the
+        `host:port` the Node bound for the session on its mesh address.
+        The platform persists it as the session's authoritative dial
+        target and serves it on the Session read projection; a repeated
+        `session_started` overwrites the stored value, so the last report
+        wins.
+
         DEFERRED-WIRING POSTURE: until the production composition root
         supplies the callback service and its NSK validator, every request
         to this endpoint returns 501 with `code:
@@ -18938,6 +19304,7 @@ paths:
                 detail: "POST /v1/nodes/{id}/sessions/{session_id} requires the production wiring of the session-callback service and its NSK validator. One or more ports are not yet provisioned in this build."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/sessions/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2"
                 code: "access_session_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
         "500":
           description: Internal server error.
           content:
@@ -20264,6 +20631,7 @@ components:
         - status
         - detail
         - instance
+        - correlation_id
       properties:
         type:
           type: string
@@ -20276,10 +20644,19 @@ components:
           description: HTTP status code generated for this occurrence.
         detail:
           type: string
-          description: Human-readable explanation specific to this occurrence.
+          description: |
+            Human-readable explanation specific to this occurrence. The
+            text is written for the caller and never carries persistence
+            or infrastructure internals.
         instance:
           type: string
           description: URI reference identifying the specific occurrence.
+        correlation_id:
+          type: string
+          description: |
+            Correlation id pairing this problem with the server log
+            record for the same failure. Echoed on the
+            `X-Correlation-Id` response header.
         code:
           type: string
           description: |
@@ -20439,14 +20816,13 @@ components:
               * `invalid_credential_assignment_id` — 400, path `{id}` on `/v1/credential-assignments/{id}/...` was not a non-zero UUID.
               * `invalid_cloud_credential_id` — 400, `RequestCredentialAssignment` body `cloud_credential_id` was not a non-zero UUID. Reuses the same code string the Cloud Credentials path id carries.
               * `ambiguous_credential_target` — 400, `RequestCredentialAssignment` body supplied BOTH `cloud_credential_id` and `cloud_id`; exactly one is required.
-              * `invalid_decision_reason` — 400, `RejectCredentialAssignment` or `RevokeCredentialAssignment` body `reason` was empty or whitespace-only.
+              * `invalid_decision_reason` — 400, `RevokeCredentialAssignment` body `reason` was empty or whitespace-only.
               * `credential_assignment_not_found` — 404, the addressed Credential Assignment does not exist.
               * `duplicate_live_assignment` — 409, a live Credential Assignment already exists for the same (Project, Cloud Credential) pair.
               * `credential_not_assignable` — 422, the named Cloud Credential is not in an assignable lifecycle state.
               * `cloud_not_usable_in_project` — 422, the `cloud_id` form named a Cloud with no approved assignment to the Project.
               * `no_eligible_credential_for_cloud` — 422, the `cloud_id` form named a usable Cloud that has no active, not-revoked, not-expired credential.
               * `illegal_transition` — 409, the requested lifecycle transition is not legal from the assignment's current state.
-              * `self_approval_denied` — 403, the caller may not approve a Credential Assignment they themselves requested.
               * `credential_assignments_not_provisioned` — 501, the composition root has not wired the Credential Assignment dependency bundle yet.
 
             The Credential Assignment surface REUSES the shared
@@ -20468,7 +20844,7 @@ components:
             The Cloud Assignment surface REUSES the shared
             `invalid_project_id`, `invalid_cloud_id`,
             `invalid_decision_reason`, `illegal_transition`,
-            `self_approval_denied`, `invalid_limit`, `invalid_cursor`,
+            `invalid_limit`, `invalid_cursor`,
             `cursor_binding_mismatch`, `invalid_body`,
             `request_body_too_large`, `unauthenticated`, and `internal`
             codes with the same semantics they carry above.
@@ -20480,18 +20856,27 @@ components:
               * `invalid_approval_id` — 400, path `{id}` on `/v1/approvals/{id}`, `.../approve`, `.../reject`, or `.../break-glass` was not a non-zero UUID.
               * `invalid_break_glass_reason` — 400, `BreakGlassApproval` body `reason` was shorter than the 16-character emergency-justification floor or whitespace-only.
               * `approval_not_found` — 404, the addressed Approval does not exist or is not visible.
+              * `self_approval_denied` — 403, the caller may not approve a proposal they themselves raised, nor an assignment row they themselves requested.
 
             The Approval Workflow surface REUSES the
             `invalid_decision_reason` (`RejectApproval` body `reason` was
-            empty or whitespace-only), `self_approval_denied` (the caller
-            may not approve a proposal they themselves raised), and
-            `illegal_transition` (the requested lifecycle transition is
-            not legal from the proposal's current state) code strings with
-            the same semantics they carry on the Credential Assignment
+            empty or whitespace-only) and `illegal_transition` (the
+            requested lifecycle transition is not legal from the
+            proposal's current state) code strings with the same
+            semantics they carry on the Credential Assignment
             surface above, plus the shared `invalid_limit`,
             `invalid_cursor`, `cursor_binding_mismatch`, `invalid_body`,
             `unauthenticated`, `permission_denied`, and `internal` codes
             with the same semantics they carry on the surfaces above.
+
+            The `ListApprovals` query filters REUSE three further code
+            strings, each carrying the approval-queue vocabulary rather
+            than the vocabulary the same string carries elsewhere in
+            this catalog:
+
+              * `invalid_kind` — 400, the `kind` query parameter was outside the `ApprovalKind` vocabulary.
+              * `invalid_status` — 400, the `status` query parameter was outside the `ApprovalState` vocabulary.
+              * `invalid_cloud_id` — 400, the `cloud_id` query parameter was not a non-zero UUID.
 
             The Blueprint Catalog surface adds the closed taxonomy
             below. Each code maps to exactly one repo / service sentinel
@@ -20662,6 +21047,7 @@ components:
         status: 404
         detail: "No route matched the request."
         instance: "/v1/unknown"
+        correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
     PermissionDenied:
       type: object
       description: |
@@ -22740,12 +23126,14 @@ components:
       description: |
         Canonical reconciliation-pull envelope for a single Node.
         The wire blocks — `peers`,
-        `policy`, `bridge`, `state`, and `reports` — are always
-        present so plexd's reconcile loop can diff by field presence
-        rather than absence; later stories (policy fan-out, bridge orchestrator, node-state reports) populate
+        `policy`, `bridge`, `state`, `reports`, `executions`, and
+        `sessions` — are always present so plexd's reconcile loop can
+        diff by field presence rather than absence; later stories
+        (policy fan-out, bridge orchestrator, node-state reports) populate
         the currently-empty blocks without changing the wire shape.
-        Empty `peers` is `[]` (never `null`); the other blocks may
-        be `null` until their owning story lands.
+        Empty `peers`, `executions`, and `sessions` are `[]` (never
+        `null`); the other blocks may be `null` until their owning
+        story lands.
       required:
         - peers
         - policy
@@ -22753,6 +23141,8 @@ components:
         - state
         - reports
         - reachability
+        - executions
+        - sessions
       properties:
         peers:
           type: array
@@ -22766,6 +23156,28 @@ components:
             Ordered by `node_id` ascending so
             two consecutive pulls against the same ledger snapshot
             are byte-equal.
+        executions:
+          type: array
+          items:
+            $ref: "#/components/schemas/NodeStateExecution"
+          description: |
+            Pending action dispatches addressed to this Node — entries
+            whose per-target status is `pending`, `ack`, or `started`
+            and whose deadline is unexpired. An entry leaves the block
+            when its target reaches a terminal status via the execution
+            callback. Ordered by `requested_at` then `execution_id`
+            ascending so two consecutive pulls against the same ledger
+            snapshot are byte-equal. Empty is `[]` (never `null`).
+        sessions:
+          type: array
+          items:
+            $ref: "#/components/schemas/NodeStateSession"
+          description: |
+            Live mediated sessions targeting a Resource this Node
+            provisions. An entry leaves the block on revocation or
+            expiry. Ordered by `issued_at` then `session_id` ascending
+            so two consecutive pulls against the same ledger snapshot
+            are byte-equal. Empty is `[]` (never `null`).
         reachability:
           allOf:
             - $ref: "#/components/schemas/Reachability"
@@ -22869,6 +23281,110 @@ components:
             is unavailable. Empty or absent means no bridge is
             currently assigned for this peer. Format:
             `<inet-or-hostname>:<port>`.
+    NodeStateExecution:
+      type: object
+      description: |
+        A single pending action dispatch projected onto the
+        `NodeStateSnapshot` envelope. It mirrors the `action_request`
+        Signed Event Bus payload minus the event-envelope fields
+        (`event_id`, `occurred_at`, `node_id`) and the callback URL: the
+        agent derives its callback path from its configured base per the
+        agent contract. The pull carries the absolute `expires_at`
+        deadline rather than the event payload's relative timeout because
+        pull delivery is delayed by the reconcile cadence.
+      required:
+        - execution_id
+        - action
+        - type
+        - status
+        - requested_at
+        - expires_at
+      properties:
+        execution_id:
+          type: string
+          format: uuid
+          description: Identifier of the Execution the dispatch belongs to (UUIDv7).
+        action:
+          type: string
+          description: Name of the dispatched action.
+        type:
+          $ref: "#/components/schemas/ActionKind"
+        parameters:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: |
+            Opaque JSON parameter document passed verbatim to the action.
+            `null` when the dispatch carries no parameters.
+        status:
+          type: string
+          enum:
+            - pending
+            - ack
+            - started
+          # x-enum-varnames pins the generated Go constant names for this
+          # enum so oapi-codegen's "prefix only on collision" heuristic
+          # cannot flip the constant form when a sibling enum is added or
+          # removed. The status is the live-target subset of
+          # ExecutionStatus, so it is inlined here rather than shared.
+          x-enum-varnames:
+            - NodeStateExecutionStatusPending
+            - NodeStateExecutionStatusAck
+            - NodeStateExecutionStatusStarted
+          description: |
+            Per-target status of the dispatch at snapshot time so a
+            re-pulling agent knows what it has already acknowledged. One
+            of `pending`, `ack`, or `started`; an entry leaves the block
+            once its target reaches a terminal status.
+        requested_at:
+          type: string
+          format: date-time
+          description: Timestamp the dispatch was requested (UTC).
+        expires_at:
+          type: string
+          format: date-time
+          description: |
+            Absolute deadline (UTC) the Node must report a terminal
+            result within. The pull carries the absolute expiry rather
+            than the event payload's relative `timeout_seconds` because
+            pull delivery is delayed by the reconcile cadence.
+    NodeStateSession:
+      type: object
+      description: |
+        A single live mediated session projected onto the
+        `NodeStateSnapshot` envelope. It mirrors the `session_setup`
+        Signed Event Bus payload minus the callback URL: the agent
+        derives its per-session callback path from its configured base
+        per the agent contract. The Node opens its on-node listener for
+        the session from this projection.
+      required:
+        - session_id
+        - jti
+        - kind
+        - target
+        - expires_at
+      properties:
+        session_id:
+          type: string
+          format: uuid
+          description: Identifier of the Session (UUIDv7).
+        jti:
+          type: string
+          description: |
+            The issued token's `jti`. Equals the session identifier.
+        kind:
+          $ref: "#/components/schemas/SessionKind"
+        target:
+          $ref: "#/components/schemas/SessionTarget"
+        expires_at:
+          type: string
+          format: date-time
+          description: Expiry timestamp (UTC) the listener tears down at.
+        idle_timeout_seconds:
+          type: integer
+          minimum: 0
+          description: |
+            Idle window in whole seconds the listener applies locally.
     NodeStatePolicy:
       type: object
       description: |
@@ -23370,14 +23886,26 @@ components:
         binary_checksum:
           type: string
           format: byte
-          minLength: 32
-          maxLength: 64
+          minLength: 44
+          maxLength: 44
           description: |
-            SHA-256 digest of the running plexd binary. The wire form
-            is the 32-byte raw digest encoded as either lowercase hex
-            (64 characters) or base64 with standard padding (44
-            characters); the handler decodes both forms and rejects
-            anything else with 400 `binary_checksum_empty`.
+            SHA-256 digest of the running plexd binary, 32 bytes
+            base64-encoded with standard padding (44 characters).
+            Anything that does not decode to exactly 32 bytes is
+            rejected with 400 `binary_checksum_empty`.
+
+            Base64 is the only accepted encoding, here and on
+            `CapabilityManifestRequest.binary_checksum` and
+            `DeclaredHook.checksum`. An earlier revision of this
+            description also offered lowercase hex; no handler ever
+            decoded it. `format: byte` means the generated server type
+            is `[]byte` and the JSON decoder base64-decodes the value
+            before any handler sees it, so a 64-character hex digest —
+            itself valid base64 — arrives as 48 bytes and fails the
+            length check with a message about the byte count that
+            never mentions the encoding. The offer is withdrawn rather
+            than implemented so one encoding holds across every
+            checksum field on the node-facing surface.
         binary_version:
           type: string
           maxLength: 4096
@@ -23514,12 +24042,14 @@ components:
       description: |
         Body for PUT /v1/nodes/{id}/capabilities. Carries the per-Node
         capability manifest snapshot plexd reports on agent boot and
-        whenever the running binary, host-key, or declared hooks
-        change: the agent binary semver, the SHA-256 of the running
+        whenever the running binary, host-key, declared hooks, or
+        built-in action inventory change: the agent binary semver, the
+        SHA-256 of the running
         binary (for tamper-evidence and rollout tracking), the
         optional SSH host-key fingerprint (for the downstream integrity
-        correlator), and the optional list of hooks the agent
-        advertises. The handler canonicalises the envelope through the
+        correlator), the optional list of hooks the agent
+        advertises, and the optional inventory of built-in actions the
+        agent implements. The handler canonicalises the envelope through the
         `tenancy.NewCapabilityManifest` value-object constructor; every
         invariant is enforced at the aggregate boundary before the
         recorder ever touches Postgres.
@@ -23586,6 +24116,138 @@ components:
             `plexd_hook_invalid`).
           items:
             $ref: "#/components/schemas/PlexdHook"
+        builtin_actions:
+          type: array
+          maxItems: 128
+          description: |
+            Optional inventory of the built-in actions the agent
+            implements — the operations `POST
+            /v1/projects/{project_id}/resources/{resource_id}/actions`
+            can dispatch against this Node with `kind: builtin`. Each
+            entry names an action, describes it, and declares the
+            parameters it accepts.
+
+            The inventory is advisory and read-only. Dispatch does not
+            consult it: an execution names its action, the Node is the
+            authority on whether it can run it, and an unknown action
+            fails at the Node. What the inventory buys is the ability to
+            answer "what can this Node do?" without dispatching
+            anything — so an operator surface can offer a Node's actual
+            actions rather than a fixed list, and so a fleet-wide
+            capability query has data to read.
+
+            Absent and empty are distinct in intent but not in effect: an
+            agent that reports no inventory is simply one the platform
+            cannot answer that question for. It is not an agent whose
+            actions are known to be none, and nothing refuses a dispatch
+            on that basis.
+
+            The manifest invariants reject duplicate action names (422
+            `builtin_action_duplicate`), more than 128 entries (422
+            `builtin_actions_too_many`), and any per-entry violation (422
+            `builtin_action_invalid`).
+          items:
+            $ref: "#/components/schemas/BuiltinAction"
+    BuiltinAction:
+      type: object
+      description: |
+        A single built-in action inside a `CapabilityManifestRequest`'s
+        `builtin_actions` inventory: what the agent calls it, what it
+        does, and what it takes.
+
+        `name` is the value a dispatch puts in `DispatchExecutionRequest.
+        action` alongside `kind: builtin`. Its constraint deliberately
+        matches that field's rather than being tightened here — a name
+        the inventory could not express would be an action the Node can
+        run and the platform could not describe.
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: |
+            Action identifier (e.g. `diagnostics.collect`,
+            `service.upgrade`). Non-empty after trimming whitespace; a
+            violation surfaces as 422 `builtin_action_invalid`. Unique
+            within one manifest — a duplicate surfaces as 422
+            `builtin_action_duplicate`.
+        description:
+          type: string
+          maxLength: 4096
+          description: |
+            Optional human-readable summary of what the action does,
+            shown on operator surfaces beside the action name.
+        parameters:
+          type: array
+          maxItems: 64
+          description: |
+            Optional list of the parameters the action accepts. Entries
+            are ordered as the agent reported them, which is the order an
+            operator surface should present them in. Duplicate parameter
+            names within one action surface as 422
+            `builtin_action_invalid`.
+          items:
+            $ref: "#/components/schemas/BuiltinActionParameter"
+    BuiltinActionParameter:
+      type: object
+      description: |
+        A single parameter declaration inside a `BuiltinAction`'s
+        `parameters` list.
+
+        Every field but `name` is descriptive: plexsphere records what
+        the agent reported and validates nothing against it. In
+        particular `type` is not a closed enum and `required` does not
+        gate dispatch — an execution carrying the wrong parameters is
+        refused by the Node that runs it, which is the only place that
+        knows the current truth. Constraining these here would create a
+        second, staler authority.
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: |
+            Parameter identifier as the action expects it in a dispatch's
+            `parameters` object. Non-empty after trimming whitespace; a
+            violation surfaces as 422 `builtin_action_invalid`.
+        type:
+          type: string
+          maxLength: 4096
+          description: |
+            Optional agent-reported type name (e.g. `string`, `int`,
+            `duration`). Free-form and recorded verbatim — see the schema
+            description for why it is not an enum.
+        required:
+          type: boolean
+          default: false
+          description: |
+            Whether the agent reports the parameter as mandatory.
+            Descriptive only; dispatch is not gated on it.
+        # DECISION: the operation `example` block deliberately omits a
+        # `default` key. Spectral's oas3-valid-schema-example validator
+        # treats an example object carrying a property named `default`
+        # as a JSON Schema (the annotation keyword) and then fails it on
+        # the sibling `type` / `required` values, which in an example are
+        # data rather than schema. The property stays in the schema and
+        # is exercised by the generated types and tests; only the inline
+        # example skips it. Reviewer: do not re-add a `default` value to
+        # a builtin_actions example. Mirrors the identical note on the
+        # hook parameter_schema `default` property.
+        default:
+          type: string
+          maxLength: 4096
+          description: |
+            Optional default value the agent applies when the parameter
+            is omitted, rendered as the agent reported it.
+        description:
+          type: string
+          maxLength: 4096
+          description: |
+            Optional human-readable summary of the parameter.
     DeclaredHook:
       type: object
       description: |
@@ -24008,7 +24670,10 @@ components:
         (`application/x-ndjson`), one `AuditEvent` object per line. The
         closed `source` set mirrors the audit sources the README pins
         (Linux auditd via AF_AUDIT Netlink, or Kubernetes audit-log
-        tailing). Events are tagged server-side with the originating Node's
+        tailing) and is closed on those two on purpose — the `source` field
+        below records why an agent-originated event has no representation
+        here and which leg carries it instead. Events are tagged
+        server-side with the originating Node's
         Domain and Project and routed to Grafana Loki with a separate
         retention class; the wire body never carries an identity subject or
         email. `source`, `action`, `outcome`, and `timestamp` are required.
@@ -24034,7 +24699,29 @@ components:
           description: |
             The audit source the event was normalised from. A value outside
             the closed set (`auditd`, `k8s`) is rejected with
-            `400 ingest_batch_malformed`.
+            `400 ingest_batch_malformed`, and because a batch is validated
+            as a whole, one unrepresentable line refuses the entire batch
+            rather than being dropped from it.
+
+            The set is closed on the two SYSTEM audit trails deliberately,
+            and stays closed: this leg carries records about what happened
+            on the host and in the cluster, under a retention class and a
+            SIEM route that exist for exactly that material. The agent's
+            own operational events are not audit records in this sense and
+            have no value here — an agent restart, for one, is already
+            reported to the control plane by the capability manifest the
+            agent PUTs on boot, carrying the binary version and checksum
+            that a `plexd started` line would not. Agent telemetry belongs
+            on `POST /v1/nodes/{id}/logs`, which is shaped for it.
+
+            An agent with no auditd reader and no Kubernetes audit-log
+            tail therefore has nothing to send on this leg, and that is the
+            intended posture rather than a gap to close by widening the
+            enum. Such an agent should omit the batch; it must not
+            reclassify its own events as `auditd` to get them accepted,
+            which would corrupt the one property this leg's consumers rely
+            on — that a record attributed to a system audit trail came from
+            one.
         action:
           type: string
           description: |
@@ -24118,9 +24805,12 @@ components:
 
         The response deliberately carries NO PSK plaintext and NO
         ciphertext — only the `(kid, wrap_key_version)` reference. The
-        rotating Node already holds its NSK and resolves the PSK
-        wrapping locally; the control plane never re-emits secret
-        material on this surface.
+        row is wrapped under the per-Domain wrap key, not the NSK, so the
+        rotating Node cannot open it locally: after rotation the Node
+        re-fetches each pairwise edge PSK from
+        `GET /v1/nodes/{id}/peers/{peer_node_id}/psk`, which serves the
+        edge key rewrapped under the caller's NSK. The control plane
+        never re-emits secret material on this surface.
       required:
         - rotation_id
         - kid
@@ -24139,9 +24829,10 @@ components:
           minLength: 1
           description: |
             Key id of the freshly-wrapped pairwise PSK the rotation
-            re-issued. Paired with `wrap_key_version` it is the
-            reference plexd uses to resolve the PSK without the
-            control plane re-transmitting secret material.
+            re-issued. Paired with `wrap_key_version` it is a server-side
+            row reference — the pair pins the exact wrapped PSK row, not a
+            path the Node resolves locally; the Node re-fetches each edge
+            PSK from `GET /v1/nodes/{id}/peers/{peer_node_id}/psk`.
         wrap_key_version:
           type: integer
           minimum: 0
@@ -24371,6 +25062,7 @@ components:
             - healthy
             - stale
             - unreachable
+            - never_reported
           description: |
             Derived edge health, computed by applying the per-Domain
             reachability policy thresholds to the per-edge handshake
@@ -24476,6 +25168,7 @@ components:
             - healthy
             - stale
             - unreachable
+            - never_reported
           description: |
             Per-Node reachability state at `generated_at`. Mirrors the
             enum values of the `Reachability` schema so a single
@@ -24489,7 +25182,9 @@ components:
       type: object
       description: |
         Per-Node reachability projection driven by the heartbeat
-        handler. The state-machine
+        handler. A Node enters the projection in `never_reported` and
+        leaves it for a heartbeat-derived verdict once its first
+        heartbeat is admitted. From there the state-machine
         transitions `healthy` → `stale` after 90 seconds without an
         accepted heartbeat and `stale` → `unreachable` after 300
         seconds. `last_heartbeat_at` is absent until the first
@@ -24505,11 +25200,17 @@ components:
             - healthy
             - stale
             - unreachable
+            - never_reported
           description: |
-            Current reachability state. `healthy` means the most
-            recent heartbeat is younger than 90s; `stale` means it is
-            between 90s and 300s old; `unreachable` means it is older
-            than 300s or no heartbeat has ever been accepted.
+            Current reachability state. `never_reported` means no
+            heartbeat has ever been admitted for the Node; it is the
+            state a Node is born in at enrolment. The other three
+            values are derived from the age of the most recent
+            admitted heartbeat: `healthy` means it is younger than
+            90s, `stale` means it is between 90s and 300s old, and
+            `unreachable` means it is older than 300s. `unreachable`
+            therefore applies only to a Node whose heartbeats
+            stopped.
         last_heartbeat_at:
           type: string
           format: date-time
@@ -26587,12 +27288,14 @@ components:
             optional. The handler persists the Resource and returns
             `201` with the hydrated `ResourceResponse`.
           * `origin=provisioned` requires `kind`,
-            `blueprint_version_id`, and `cloud_credential_id`; the
-            optional `parameters` object carries the typed values
-            validated against the BlueprintVersion's
-            `parameter_schema`. The handler creates the Resource,
-            mints a Pending `ProvisionedResource` via the broker, and
-            returns `202` with a `Location` header.
+            `blueprint_version_id`, and `cloud_credential_id`, and
+            rejects `external_ref` — the handle of a provisioned
+            Resource is assigned by the platform. The optional
+            `parameters` object carries the typed values validated
+            against the BlueprintVersion's `parameter_schema`. The
+            handler creates the Resource, mints a Pending
+            `ProvisionedResource` via the broker, and returns `202`
+            with a `Location` header.
 
         A body with `origin` absent or outside `{adopted, provisioned}`
         is rejected with `400 invalid_resource_origin`. A body that
@@ -26620,7 +27323,12 @@ components:
           description: |
             Optional external-system reference for the adopted flow
             (URN, ARN, vendor-opaque id). Trimmed; whitespace-only is
-            rejected. Omit on the provisioned flow.
+            rejected. Rejected with `400 invalid_resource` on the
+            provisioned flow: the platform assigns that Resource's
+            handle itself, because the handle is what the enrolling
+            agent presents at registration and it learns it from the
+            material the provisioning broker renders, not from an
+            operator.
         blueprint_version_id:
           type: string
           format: uuid
@@ -26705,8 +27413,13 @@ components:
         external_ref:
           type: string
           description: |
-            Optional external-system reference. Absent when the
-            Resource declared none.
+            The Resource handle. On an adopted Resource this is the
+            optional external-system reference the operator supplied,
+            absent when they supplied none. On a provisioned Resource
+            it is the platform-assigned handle the enrolling agent
+            registers with, and it is always present — except on
+            Resources created before the platform began assigning one,
+            which are not repaired in place.
         origin:
           $ref: "#/components/schemas/ResourceOrigin"
         created_at:
@@ -26765,8 +27478,7 @@ components:
       description: |
         Metadata projection of a Credential Assignment. The shape is
         shared by `RequestCredentialAssignment`,
-        `ListCredentialAssignments`, `ApproveCredentialAssignment`,
-        `RejectCredentialAssignment`, and `RevokeCredentialAssignment`
+        `ListCredentialAssignments`, and `RevokeCredentialAssignment`
         so clients only need one binding.
       required:
         - id
@@ -26872,10 +27584,12 @@ components:
     CredentialAssignmentDecisionRequest:
       type: object
       description: |
-        Body for `POST /v1/credential-assignments/{id}/reject` and
-        `POST /v1/credential-assignments/{id}/revoke`. The `reason` is
-        recorded on the lifecycle outbox event so the decision carries
-        an approver- or operator-supplied audit string.
+        Body for `POST /v1/credential-assignments/{id}/revoke`. The
+        `reason` is recorded on the lifecycle outbox event so the
+        decision carries an operator-supplied audit string. Approving
+        and rejecting an assignment happens on the approvals queue via
+        `POST /v1/approvals/{id}/approve` and
+        `POST /v1/approvals/{id}/reject`.
       required:
         - reason
       additionalProperties: false
@@ -26918,8 +27632,7 @@ components:
       description: |
         Metadata projection of a Cloud Assignment. The shape is shared
         by `RequestCloudAssignment`, `ListCloudAssignments`,
-        `GrantCloudAssignment`, `ApproveCloudAssignment`,
-        `RejectCloudAssignment`, and `RevokeCloudAssignment` so clients
+        `GrantCloudAssignment`, and `RevokeCloudAssignment` so clients
         only need one binding.
       required:
         - id
@@ -27019,10 +27732,12 @@ components:
     CloudAssignmentDecisionRequest:
       type: object
       description: |
-        Body for `POST /v1/cloud-assignments/{id}/reject` and
-        `POST /v1/cloud-assignments/{id}/revoke`. The `reason` is
-        recorded on the lifecycle outbox event so the decision carries
-        an operator-supplied audit string.
+        Body for `POST /v1/cloud-assignments/{id}/revoke`. The `reason`
+        is recorded on the lifecycle outbox event so the decision
+        carries an operator-supplied audit string. Approving and
+        rejecting an assignment happens on the approvals queue via
+        `POST /v1/approvals/{id}/approve` and
+        `POST /v1/approvals/{id}/reject`.
       required:
         - reason
       additionalProperties: false
@@ -27034,6 +27749,20 @@ components:
           description: |
             Decision rationale. Non-empty — whitespace-only is
             rejected with `400 invalid_decision_reason`.
+    ApprovalKind:
+      type: string
+      enum:
+        - approval
+        - credential_assignment
+        - cloud_assignment
+      description: |
+        Source family the queue row was projected from. `approval` marks
+        a dual-control Approval raised against a Domain
+        `ApprovalPolicy`; `credential_assignment` marks a Credential
+        Assignment awaiting a decision on the Cloud Credential it
+        spends; `cloud_assignment` marks a Cloud Assignment awaiting a
+        decision on the Cloud it spends. The kind selects which per-row
+        authorisation check and which decide path apply.
     ApprovalState:
       type: string
       enum:
@@ -27042,8 +27771,9 @@ components:
         - approved
         - rejected
         - expired
+        - revoked
       description: |
-        Lifecycle state of an Approval. `proposed` is the opening state
+        Lifecycle state of a queue row. `proposed` is the opening state
         before the policy is evaluated; `pending-approval` means the
         Domain's `ApprovalPolicy` gated the proposal and it awaits an
         operator decision; `approved` is the terminal accept state
@@ -27051,35 +27781,53 @@ components:
         or a break-glass override); `rejected` is the terminal state an
         operator decision declines into; `expired` is the terminal state
         the background sweeper drives an un-decided proposal into past
-        its deadline. The state is a stored column advanced only by the
-        application service's transition rules.
+        its deadline; `revoked` is the terminal state a previously
+        approved assignment row is torn down into. On an assignment row
+        the wire state `pending-approval` presents the stored assignment
+        state `requested`, and `expired` never occurs. The state is a
+        stored column advanced only by the application service's
+        transition rules.
     Approval:
       type: object
       description: |
-        Metadata projection of an Approval. The shape is shared by
-        `ListApprovals`, `GetApproval`, `ApproveApproval`,
+        Metadata projection of one approval-queue row. The shape is
+        shared by `ListApprovals`, `GetApproval`, `ApproveApproval`,
         `RejectApproval`, and `BreakGlassApproval` so clients only need
-        one binding.
+        one binding, and it covers all three queue sources: generic
+        Approvals, Credential Assignments, and Cloud Assignments.
+        `kind` names the source, and a client reads it before any field
+        a single source owns. `project_id` and `materialised` are set
+        on assignment rows; `expires_at`, `payload`, and
+        `caveat_context` are set on `approval` rows.
       required:
         - id
+        - kind
         - domain_id
         - proposer_subject
         - action_kind
         - target_resource
         - state
         - created_at
-        - expires_at
       properties:
         id:
           type: string
           format: uuid
           description: Approval identifier (UUIDv7).
+        kind:
+          $ref: "#/components/schemas/ApprovalKind"
         domain_id:
           type: string
           format: uuid
           description: |
             Identifier of the owning Domain — the residency pivot the
             ReBAC gate authorises against.
+        project_id:
+          type: string
+          format: uuid
+          description: |
+            Identifier of the consuming Project the assignment binds
+            into. Set on `credential_assignment` and `cloud_assignment`
+            rows; absent on `approval` rows.
         proposer_subject:
           type: string
           description: |
@@ -27106,6 +27854,13 @@ components:
             the parameters of the action the proposer intends to run.
         state:
           $ref: "#/components/schemas/ApprovalState"
+        materialised:
+          type: boolean
+          description: |
+            Whether the assignment's ReBAC binding is currently live.
+            `true` only while the assignment is in the `approved`
+            state. Set on `credential_assignment` and `cloud_assignment`
+            rows; absent on `approval` rows.
         created_at:
           type: string
           format: date-time
@@ -27135,7 +27890,10 @@ components:
           format: date-time
           description: |
             Deadline past which the background sweeper expires an
-            un-decided proposal (UTC).
+            un-decided proposal (UTC). Set on `approval` rows only.
+            Assignment rows carry no deadline and never expire, so the
+            field is absent on `credential_assignment` and
+            `cloud_assignment` rows.
         caveat_context:
           type: object
           description: |
@@ -27777,6 +28535,15 @@ components:
             live.
         target:
           $ref: "#/components/schemas/SessionTarget"
+        listener_endpoint:
+          type: string
+          pattern: '^.+:[0-9]{1,5}$'
+          maxLength: 261
+          description: |
+            The `host:port` the target Node reported for this Session, and
+            the endpoint the attach gateway dials. Absent until the Node's
+            first `session_started` activity row for a `tcp` session
+            settles it.
     SessionList:
       type: object
       description: |
@@ -27886,8 +28653,10 @@ components:
         Session projection, the signed EdDSA JWT (delivered EXACTLY ONCE,
         here — it is never persisted server-side beyond the identifier and
         expiry, and never re-exposed through the list or read projections),
-        the per-kind plexd listener endpoint the operator's client
-        connects to, and the expiry.
+        and the expiry. The body carries no listener endpoint: the target
+        Node reports its mediated-listener coordinate after issuance, and
+        it settles on the nested Session projection served by
+        `GetSession` / `ListSessions`.
       required:
         - session_id
         - token
@@ -27911,13 +28680,6 @@ components:
           format: date-time
           description: |
             Expiry timestamp (UTC) of the issued Session and its token.
-        listener_endpoint:
-          type: string
-          pattern: '^.+:[0-9]{1,5}$'
-          maxLength: 261
-          description: |
-            The on-Node endpoint (`host:port`) the operator's client
-            connects to for this session kind.
         session:
           $ref: "#/components/schemas/Session"
     RevokeSessionRequest:
@@ -28022,6 +28784,13 @@ components:
           description: |
             Target port the tunnel connected to. Present on
             `session_started`.
+        listener_endpoint:
+          type: string
+          pattern: '^.+:[0-9]{1,5}$'
+          maxLength: 261
+          description: |
+            The `host:port` the Node bound for this session on its mesh
+            address. Present only on `session_started`.
         bytes_in:
           type: integer
           minimum: 0
@@ -28069,6 +28838,67 @@ components:
           allOf:
             - $ref: "#/components/schemas/SessionActivityTCP"
           description: Populated only for a `tcp` session.
+    SSEEventActionRequest:
+      type: object
+      description: |
+        Payload of the `action_request` Signed Event Bus event delivered
+        to the target Node's event stream. The Node runs the dispatched
+        action from this envelope and reports its terminal result back to
+        the carried callback URL. One Execution fans out to one event per
+        target Node, so two targets of the same dispatch share an
+        `execution_id` but carry distinct `node_id` and `event_id`.
+      required:
+        - event_id
+        - occurred_at
+        - execution_id
+        - node_id
+        - action
+        - type
+        - timeout_seconds
+        - callback_url
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          description: |
+            Fresh per-dispatch-event identifier (UUIDv7), distinct from
+            `execution_id` so the event carries its own identity.
+        occurred_at:
+          type: string
+          format: date-time
+          description: Timestamp the event was produced (UTC).
+        execution_id:
+          type: string
+          format: uuid
+          description: Identifier of the Execution the dispatch belongs to (UUIDv7).
+        node_id:
+          type: string
+          format: uuid
+          description: The single target Node this event addresses (UUIDv7).
+        action:
+          type: string
+          description: Name of the dispatched action.
+        type:
+          $ref: "#/components/schemas/ActionKind"
+        parameters:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: |
+            Opaque JSON parameter document passed verbatim to the action.
+            `null` when the dispatch carries no parameters.
+        timeout_seconds:
+          type: integer
+          minimum: 0
+          description: |
+            Per-dispatch timeout in whole seconds the Node must report a
+            terminal result within.
+        callback_url:
+          type: string
+          format: uri
+          description: |
+            Absolute URL the Node reports its result back to, built per the
+            template `{base}/v1/nodes/{node_id}/executions/{execution_id}`.
     SSEEventSessionSetup:
       type: object
       description: |
@@ -29971,13 +30801,17 @@ components:
       type: object
       description: |
         One per-Node capability inventory row returned by
-        `ListCapabilities` — a metadata-only projection of the Node's
+        `ListCapabilities` — a projection of the Node's
         reported capability manifest paired with its checksum status.
+        It carries the binary metadata, the checksum verdict, and the
+        built-in action inventory the agent advertised; the hook lists
+        are not projected here (see the Hook Catalog surfaces).
       required:
         - node_id
         - domain_id
         - binary_version
         - status
+        - builtin_actions
         - reported_at
       properties:
         node_id:
@@ -30004,6 +30838,25 @@ components:
             has not yet reported a checksum.
         status:
           $ref: "#/components/schemas/CapabilityStatus"
+        builtin_actions:
+          type: array
+          description: |
+            The built-in actions the Node's agent advertised on its most
+            recent capability manifest, in the order it reported them.
+            This is the read side of
+            `CapabilityManifestRequest.builtin_actions` — what an
+            operator surface reads to offer a Node's actual actions
+            rather than a fixed list.
+
+            Required, so every row carries the key and a client needs no
+            null-check: a Node that reported no inventory renders the
+            empty array. That is deliberately NOT the same claim as "this
+            Node supports no actions" — an agent that predates the field
+            and one that reports an empty list are indistinguishable
+            here. Do not treat an empty array as a reason to refuse a
+            dispatch; the Node remains the authority on what it can run.
+          items:
+            $ref: "#/components/schemas/BuiltinAction"
         reported_at:
           type: string
           format: date-time
@@ -32021,10 +32874,8 @@ components:
         format: uuid
       description: |
         Credential Assignment identifier (UUIDv7). Bound on
-        `/v1/credential-assignments/{id}/approve`,
-        `/v1/credential-assignments/{id}/reject`, and
         `/v1/credential-assignments/{id}/revoke` for the Credential
-        Assignment decision surface.
+        Assignment revocation surface.
     CloudAssignmentID:
       in: path
       name: id
@@ -32034,10 +32885,8 @@ components:
         format: uuid
       description: |
         Cloud Assignment identifier (UUIDv7). Bound on
-        `/v1/cloud-assignments/{id}/approve`,
-        `/v1/cloud-assignments/{id}/reject`, and
         `/v1/cloud-assignments/{id}/revoke` for the Cloud Assignment
-        decision surface.
+        revocation surface.
     IntegrityViolationID:
       in: path
       name: id
@@ -32305,8 +33154,11 @@ components:
     # credential was invisible to every generated client. The document
     # default (cookie or operator bearer) is declared at the root;
     # operations on the authn-middleware bypass list opt out with
-    # `security: []`, and the node-agent surface overrides to
-    # `nskBearer`. The spec-side sets mirror
+    # `security: []`, the node-agent write surface overrides to
+    # `nskBearer` alone, and the node-agent read surface (the Node
+    # state, events, and reachability reads and the plexd artifact
+    # reads) lists `nskBearer` as an alternative alongside the operator
+    # default. The spec-side sets mirror
     # internal/identity/authn/middleware.DefaultBypass().
     sessionCookie:
       type: apiKey
@@ -32341,8 +33193,13 @@ components:
         Node Secret Key (NSK) plaintext carried in the
         `Authorization: Bearer` header — the per-Node credential minted
         exactly once by `POST /v1/register`. Authenticates the
-        node-agent surface (heartbeat, endpoint, secrets, state
-        reports, capabilities, integrity violations, telemetry ingest,
-        execution and session callbacks, and the mesh key-rotation
-        completion). A missing or malformed NSK surfaces as `401`; a
-        revoked NSK surfaces as `401` with `code: nsk_revoked`.
+        node-agent surface. On the NSK-only write surface (heartbeat,
+        endpoint, secrets, state reports, capabilities, integrity
+        violations, telemetry ingest, execution and session callbacks,
+        and the mesh key-rotation completion) the NSK is the sole
+        accepted credential. On the dual-credential read surface (the
+        Node state, events, and reachability reads and the plexd
+        artifact and signature reads) the NSK is accepted as an
+        alternative to the operator credentials. A missing or malformed
+        NSK surfaces as `401`; a revoked NSK surfaces as `401` with
+        `code: nsk_revoked`.
