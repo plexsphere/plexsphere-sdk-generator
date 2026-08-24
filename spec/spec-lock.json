@@ -2,6 +2,6 @@
   "source": "https://api.plexsphere.com/plexsphere-v1.yaml",
   "file": "spec/plexsphere-v1.yaml",
   "apiVersion": "v1",
-  "sha256": "11b71dccaf16083d8ec57e9fec7719b1e7684feb2bedd54591b4af5de53a36e1",
-  "fetchedAt": "2026-08-04T20:56:40Z"
+  "sha256": "ec7a3bcdb99b624c7fe8517b45f8759c20bd4247fd8e66f2263335a8943c93ff",
+  "fetchedAt": "2026-08-24T06:29:13Z"
 }
