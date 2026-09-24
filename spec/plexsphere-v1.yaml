@@ -33,6 +33,10 @@ info:
     (`Authorization: Bearer …`) are exempt because the bearer scheme
     is not auto-attached by browsers; the sign-in surface
     (`/v1/auth/*`) is exempt because it cannot carry a Principal yet.
+    A cookie-authenticated WebSocket upgrade (`GET` with
+    `Upgrade: websocket`) gets the Origin / Sec-Fetch-Site check
+    without the token, because a browser cannot set a header on the
+    handshake.
   license:
     # DECISION: both `name` and `identifier` (SPDX) are declared. Per the
     # OpenAPI 3.1 License Object, `identifier` is mutually exclusive only
@@ -1481,6 +1485,22 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "404":
           description: Token not found (or does not belong to caller).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: |
+            The token has already been rotated; rotate its successor
+            instead (Problem.code = `token_already_rotated`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "410":
+          description: |
+            The token is revoked or expired and cannot be rotated
+            (Problem.code = `token_revoked` / `token_expired`).
           content:
             application/problem+json:
               schema:
@@ -3113,7 +3133,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/APITokenIssueResponse"
         "400":
-          description: Invalid body (bad env_prefix, missing identity_ref).
+          description: |
+            Invalid body (bad env_prefix, missing identity_ref), or an
+            `identity_ref` that names no user or service identity
+            (Problem.code = `invalid_identity_ref`).
           content:
             application/problem+json:
               schema:
@@ -3131,6 +3154,9 @@ paths:
             problem carrying the ReBAC denial `reason`, traversed
             `relation_path`, and the `correlation_id` that pairs the
             response with the audit entry emitted by `internal/audit`.
+            A caller authenticated with an API token (a `psk_` bearer)
+            cannot mint tokens through the admin surface and must sign
+            in interactively (Problem.code = `bearer_cannot_mint`).
           content:
             application/problem+json:
               schema:
@@ -3171,7 +3197,10 @@ paths:
                 items:
                   $ref: "#/components/schemas/APITokenSummary"
         "400":
-          description: Invalid `identity_ref` (missing, wrong shape, bad UUID).
+          description: |
+            Invalid `identity_ref` (missing, wrong shape, bad UUID), or an
+            `identity_ref` that names no user or service identity
+            (Problem.code = `invalid_identity_ref`).
           content:
             application/problem+json:
               schema:
@@ -3287,13 +3316,32 @@ paths:
         "403":
           description: |
             Caller is not authorized to rotate the token. Body is a
-            `PermissionDenied` problem.
+            `PermissionDenied` problem. A caller authenticated with an
+            API token (a `psk_` bearer) cannot rotate tokens through the
+            admin surface and must sign in interactively
+            (Problem.code = `bearer_cannot_mint`).
           content:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/PermissionDenied"
         "404":
           description: Token not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: |
+            The token has already been rotated; rotate its successor
+            instead (Problem.code = `token_already_rotated`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "410":
+          description: |
+            The token is revoked or expired and cannot be rotated
+            (Problem.code = `token_revoked` / `token_expired`).
           content:
             application/problem+json:
               schema:
@@ -4293,14 +4341,14 @@ paths:
         (GET /v1/nodes/{id}/state), which stays the authoritative
         delivery channel for mesh state. This endpoint answers 501 with
         `code: signed_event_bus_not_provisioned` until the operator
-        configures the event-bus seams — the EventStream, NonceStore,
+        configures the event-bus seams — the EventStream,
         SignatureVerifier, RelationChecker, and NodeRepo ports — after
-        which it streams signed envelopes. The bus is single-replica: the
-        backing PLEXSPHERE_NODE_EVENTS JetStream stream and the in-memory
-        replay-protection store require the API server to run a single
-        replica until a distributed nonce store is wired. See
+        which it streams signed envelopes. The bus runs on any number of
+        API replicas: the relay cursor, the envelope nonce set and the
+        signing-key rotation signal are shared through the database, so
+        every replica reads and writes the same state. See
         docs/architecture/mesh-event-bus-roadmap.md for the un-descope
-        checklist and the single-replica constraint.
+        checklist.
       tags:
         - mesh
       parameters:
@@ -4468,8 +4516,8 @@ paths:
             event-bus seams. The Problem body's `code` field is
             `signed_event_bus_not_provisioned` so log scrapers can alert
             on the unprovisioned state. The surface returns a stream once
-            EventStream, NonceStore, SignatureVerifier, RelationChecker,
-            and NodeRepo are wired into the v1 handler dependency cone —
+            EventStream, SignatureVerifier, RelationChecker, and
+            NodeRepo are wired into the v1 handler dependency cone —
             see docs/architecture/mesh-event-bus-roadmap.md.
           content:
             application/problem+json:
@@ -4479,7 +4527,7 @@ paths:
                 type: "https://plexsphere.com/errors/signed-event-bus-not-provisioned"
                 title: "Not Implemented"
                 status: 501
-                detail: "GET /v1/nodes/{id}/events requires the production wiring of EventStream, NonceStore, SignatureVerifier, RelationChecker, and NodeRepo. One or more ports are not yet provisioned in this build (see docs/architecture/mesh-event-bus-roadmap.md)."
+                detail: "GET /v1/nodes/{id}/events requires the production wiring of EventStream, SignatureVerifier, RelationChecker, and NodeRepo. One or more ports are not yet provisioned in this build (see docs/architecture/mesh-event-bus-roadmap.md)."
                 instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/events"
                 code: "signed_event_bus_not_provisioned"
                 correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
@@ -15192,13 +15240,13 @@ paths:
           required: false
           schema:
             type: string
-          description: SpiceDB object type to filter on (e.g. `domain`, `node`).
+          description: SpiceDB object type to filter on (e.g. `domain`, `node`). Matches every entry whose `object.type` equals the value; without `object_id` it returns every entry of that type.
         - in: query
           name: object_id
           required: false
           schema:
             type: string
-          description: Opaque object identifier within `object_type`.
+          description: Object identifier to filter on. Matches every entry whose `object.id` equals the value; with `object_type` it addresses one object, without it the identifier matches under any type.
         - in: query
           name: reason
           required: false
@@ -16492,13 +16540,13 @@ paths:
           required: false
           schema:
             type: string
-          description: SpiceDB object type to filter on (e.g. `cloud`, `platform`).
+          description: SpiceDB object type to filter on (e.g. `cloud`, `platform`). Matches every entry whose `object.type` equals the value; without `object_id` it returns every entry of that type.
         - in: query
           name: object_id
           required: false
           schema:
             type: string
-          description: Opaque object identifier within `object_type`.
+          description: Object identifier to filter on. Matches every entry whose `object.id` equals the value; with `object_type` it addresses one object, without it the identifier matches under any type.
         - in: query
           name: reason
           required: false
@@ -20121,9 +20169,20 @@ paths:
         `listener_endpoint` is never written to the client; the browser only
         ever sees the proxied stream. Error paths (before the upgrade
         completes) follow the RFC 9457 `application/problem+json` envelope.
+
+        A browser authenticates the upgrade with the session cookie. A
+        cookie-authenticated upgrade must carry `Sec-Fetch-Site: same-origin`
+        or an `Origin` listed in `PLEXSPHERE_CSRF_ALLOWED_ORIGINS`; otherwise
+        it is refused `403` with `code` ∈ { `csrf_origin_mismatch`,
+        `csrf_origin_not_configured`, `csrf-origin-missing` }. The upgraded
+        connection has no request deadline, and the gateway sends a
+        WebSocket ping every 30 seconds so an idle connection is not closed
+        by a proxy. One client message may carry at most 1 MiB; a larger
+        one closes the connection with WebSocket close code `1009`.
       tags:
         - access
       security:
+        - sessionCookie: []
         - operatorBearer: []
       parameters:
         - $ref: "#/components/parameters/SessionProjectID"
@@ -20147,7 +20206,11 @@ paths:
             Caller is not authorized to attach to this Session's Resource.
             Body is a `PermissionDenied` problem; the gateway closes the
             socket with WebSocket close code `1008` (policy violation) when
-            the denial is detected after the upgrade.
+            the denial is detected after the upgrade. A cookie-authenticated
+            upgrade that fails the Origin check is refused by the CSRF
+            middleware instead, with a plain `Problem` that carries no
+            `reason` and whose `code` ∈ { `csrf_origin_mismatch`,
+            `csrf_origin_not_configured`, `csrf-origin-missing` }.
           content:
             application/problem+json:
               schema:
@@ -20317,14 +20380,17 @@ paths:
              `nsk_node_mismatch` so a leaked NSK cannot be replayed
              against a sibling Node's session.
           3. Appends the reported per-kind activity row. An `ssh` session
-             records `command_executed` / `command_exited` activity; a
-             `k8s` session records `api_request` activity; a `tcp` session
-             records exactly a `session_started` and a `session_ended`
-             pair — the TCP shape is deliberately payload-blind, with no
-             L7 parsing.
+             records `command_executed` / `command_exited` activity per
+             command and a `session_started` / `session_ended` pair for
+             its listener; a `k8s` session records `api_request`
+             activity; a `tcp` session records exactly a
+             `session_started` and a `session_ended` pair — the TCP shape
+             is deliberately payload-blind, with no L7 parsing. The
+             populated request member must match the session's kind.
 
-        A `tcp` `session_started` row may carry a `listener_endpoint`, the
-        `host:port` the Node bound for the session on its mesh address.
+        An `ssh` or `tcp` `session_started` row may carry a
+        `listener_endpoint`, the `host:port` the Node bound for the
+        session on its mesh address.
         The platform persists it as the session's authoritative dial
         target and serves it on the Session read projection; a repeated
         `session_started` overwrites the stored value, so the last report
@@ -23196,10 +23262,11 @@ components:
               * `invitation_not_found` — 404, invitation does not exist or is in a different Domain.
               * `cursor_binding_mismatch` — 403, `ListIdentities` / `ListInvitations` cursor was minted for a different caller than the one presenting it (per-(caller, pepper) HMAC binding rejected the replay).
 
-            CSRF defence-in-depth adds three 403 codes
+            CSRF defence-in-depth adds four 403 codes
             scoped to state-changing cookie-authenticated `/v1/*`
             requests. Bearer-authenticated requests and `GET` / `HEAD`
-            requests are exempt. The codes are:
+            requests are exempt, except a cookie-authenticated WebSocket
+            upgrade, which gets the Origin check only. The codes are:
 
               * `csrf_token_mismatch` — 403, the `X-Plexsphere-CSRF`
                 header is absent, empty, or does not byte-match the
@@ -23215,6 +23282,10 @@ components:
                 A misconfigured production deployment surfaces this
                 code on every cookie-authenticated mutation rather
                 than silently bypassing the CSRF check.
+              * `csrf-origin-missing` — 403, the request carried
+                neither an `Origin` nor a `Sec-Fetch-Site` header, so
+                the middleware cannot tell which page sent it. The
+                code is spelled with hyphens, as the server sends it.
 
             Cloud Inventory CRUD adds the closed taxonomy below. Each
             code maps to exactly one
@@ -24039,8 +24110,9 @@ components:
     APITokenSummary:
       type: object
       description: |
-        Plaintext-free summary entry for GET /v1/auth/tokens. Matches
-        the persisted APIToken aggregate minus any secret material.
+        Plaintext-free summary entry for GET /v1/auth/tokens and
+        GET /v1/admin/tokens. Matches the persisted APIToken aggregate
+        minus any secret material.
       required:
         - id
         - env_prefix
@@ -24070,6 +24142,16 @@ components:
           type: string
           format: date-time
           description: Timestamp the token was most recently rotated.
+        revoked_at:
+          type: string
+          format: date-time
+          description: Revocation timestamp; absent while the token is not revoked.
+        sunset_at:
+          type: string
+          format: date-time
+          description: |
+            Instant the plaintext stops authenticating after a rotation;
+            absent until the token is rotated.
     APITokenRotateResponse:
       type: object
       description: |
@@ -31850,13 +31932,22 @@ components:
       type: object
       description: |
         SSH session target — the login user and the optional allowed-
-        command allowlist the mediated SSH session is constrained to.
+        command allowlist the mediated SSH session is constrained to. The
+        Node's session listener authenticates the login user with SSH
+        password authentication, taking the session token as the
+        password.
       required:
         - user
       properties:
         user:
           type: string
           description: Login user the mediated SSH session connects as.
+        # DECISION: a non-empty allowlist admits an `exec` request only when
+        # its command equals an entry byte for byte, and refuses `shell`.
+        # Rejected alternatives: prefix or argv-token matching, which widen
+        # what one entry admits in ways an operator cannot read off the list,
+        # and admitting a shell, inside which no allowlist can be enforced.
+        # Exact match is the narrowest reading; widening it later is additive.
         allowed_commands:
           type: array
           maxItems: 64
@@ -31864,8 +31955,10 @@ components:
             type: string
           description: |
             Optional allowlist of commands the session may run. An empty
-            or omitted list grants an unconstrained interactive session;
-            bounded at 64 entries.
+            or omitted list grants an unconstrained interactive session. A
+            non-empty list restricts the session to `exec` requests whose
+            command equals an entry byte for byte, and the listener
+            refuses an interactive shell. Bounded at 64 entries.
     SessionTargetK8s:
       type: object
       description: |
@@ -32020,8 +32113,8 @@ components:
           description: |
             The `host:port` the target Node reported for this Session, and
             the endpoint the attach gateway dials. Absent until the Node's
-            first `session_started` activity row for a `tcp` session
-            settles it.
+            first `session_started` activity row for an `ssh` or `tcp`
+            session settles it.
     SessionList:
       type: object
       description: |
@@ -32177,19 +32270,34 @@ components:
             (`ttl_expired`, `idle_timeout`) are set internally, never by
             this call, so a request carrying one fails validation
             instead of reaching the handler.
+    # DECISION: the ssh lifecycle row extends SessionActivitySSH instead of
+    # adding a fourth request member. SessionActivityRequest stays
+    # exactly-one-of ssh / k8s / tcp, matching the session kind, so the
+    # populated member still names the kind the Node claims. The rejected
+    # alternative, a separate lifecycle member, would let one envelope carry
+    # two members for one kind and break that one-member-per-kind rule.
     SessionActivitySSH:
       type: object
       description: |
-        Per-command SSH activity row a Node posts for an `ssh` session.
-      required:
-        - command
+        SSH activity row a Node posts for an `ssh` session. A row has one
+        of two shapes:
+
+          - A command row carries `command`, optionally with `exit_code`,
+            `started_at`, and `completed_at`, and neither `phase` nor
+            `terminated_by`. The Node posts one per `exec` request.
+          - A lifecycle row carries `phase`, plus `listener_endpoint` on
+            `session_started` or `terminated_by` on `session_ended`, and
+            none of the command fields.
+
+        A row that mixes the two shapes, or carries neither, is refused
+        with 400 `malformed_session_activity_request`.
       properties:
         command:
           type: string
           maxLength: 1024
           description: |
             The command the session executed, captured as raw text bounded
-            at 1 KiB.
+            at 1 KiB. Present on a command row only.
         exit_code:
           type: integer
           description: Process exit code the command reported, when settled.
@@ -32201,6 +32309,44 @@ components:
           type: string
           format: date-time
           description: Timestamp the command completed (UTC), when settled.
+        phase:
+          type: string
+          enum:
+            - session_started
+            - session_ended
+          # x-enum-varnames pins the generated Go constant names against
+          # the prefix-flip heuristic (REQ-012, PX-0077).
+          x-enum-varnames:
+            - SessionActivitySSHPhaseSessionStarted
+            - SessionActivitySSHPhaseSessionEnded
+          description: |
+            Lifecycle phase: `session_started` marks the listener bound,
+            `session_ended` marks it closed. Present on a lifecycle row
+            only.
+        listener_endpoint:
+          type: string
+          pattern: '^.+:[0-9]{1,5}$'
+          maxLength: 261
+          description: |
+            The `host:port` the Node bound for this session on its mesh
+            address. Present only on a `session_started` lifecycle row.
+        terminated_by:
+          type: string
+          enum:
+            - ttl_expired
+            - idle_timeout
+            - plexd_close
+            - operator_revoke
+          # x-enum-varnames pins the generated Go constant names against
+          # the prefix-flip heuristic (REQ-012, PX-0077).
+          x-enum-varnames:
+            - SessionActivitySSHTerminatedByTtlExpired
+            - SessionActivitySSHTerminatedByIdleTimeout
+            - SessionActivitySSHTerminatedByPlexdClose
+            - SessionActivitySSHTerminatedByOperatorRevoke
+          description: |
+            What closed the listener. Present only on a `session_ended`
+            lifecycle row.
     SessionActivityK8s:
       type: object
       description: |
