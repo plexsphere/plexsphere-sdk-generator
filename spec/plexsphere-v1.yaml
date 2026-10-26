@@ -1702,12 +1702,15 @@ paths:
       operationId: ListRelationTuples
       summary: List relation tuples scoped to a Project.
       description: |
-        Returns a page of relation tuples persisted under the addressed
-        Project (selected by the required `project_id` query
-        parameter). Per-row visibility is layered on top of the page —
-        rows the caller cannot `read` are filtered out so the response
-        items are a subset of the persistence-level page. Cursor
-        pagination mirrors `/v1/projects` exactly.
+        Returns a page of the relation tuples `CreateRelationTuple`
+        recorded under the addressed Project (selected by the required
+        `project_id` query parameter), in id order. The list is the
+        ledger of what this API wrote: relationships the event sync,
+        the seeds or a reconciler write do not appear in it. Per-row
+        visibility is layered on top of the page — rows the caller
+        cannot `read` are filtered out so the response items are a
+        subset of the persistence-level page. Cursor pagination mirrors
+        `/v1/projects` exactly.
       tags:
         - authz
       parameters:
@@ -1763,11 +1766,32 @@ paths:
       summary: Create a relation tuple under a Project.
       description: |
         Persists a new relation tuple `(subject, relation, resource)`
-        scoped to the addressed Project (selected by the required
+        owned by the addressed Project (selected by the required
         `project_id` query parameter). The handler authorises `manage`
-        on `project:<id>` BEFORE invoking the service so an
-        unauthorised caller never produces a `RelationTupleCreated`
-        outbox row.
+        on `project:<id>` BEFORE anything is written, writes the
+        relationship and records it in the relation-tuple ledger, which
+        owns the `id` the response carries. A Create of a triple the
+        ledger already holds answers with that tuple's `id`, owning
+        Project and creation time, and takes the new caveat.
+
+        `manage` on the Project authorises grants on objects that
+        Project governs, and only on those. The `resource` must be one
+        of:
+
+        - the addressed Project itself (`project:<project_id>`);
+        - a `resource:<id>` or `policy:<id>` whose `parent` is the
+          addressed Project;
+        - a `labeldefinition:<id>` registered at the addressed
+          Project's scope or at the scope of the Domain the Project
+          belongs to.
+
+        Any other resource — `platform:*`, any `domain:*` (the
+        Project's own Domain included), a Project, Resource, Policy or
+        Label definition outside the addressed Project, a platform
+        Label definition, and every other object type — is refused
+        with `403` and `reason: out_of_scope` before anything is
+        written. Grants on those objects belong to the authority that
+        governs them, not to a Project.
 
         The optional `caveat_context` is the set of caveat field
         NAMES the tuple carries — never values. Carrying values across
@@ -1808,8 +1832,9 @@ paths:
             `code` ∈ { `invalid_triple`, `invalid_project_id`,
             `invalid_body` }. `invalid_triple` covers both the shape
             checks the handler makes itself — empty subject / relation
-            / resource — and the schema rejections only the ReBAC
-            backend can make: an unknown object definition, an unknown
+            / resource, or a resource that is not `type:id` with an id
+            of letters, digits, and `/ _ | - = +` — and the schema
+            rejections only the ReBAC backend can make: an unknown object definition, an unknown
             relation, a subject type the relation does not admit, or a
             PERMISSION named where a relation belongs. Permissions are
             computed from relations, so nothing can be written into
@@ -1826,8 +1851,12 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "403":
           description: |
-            Caller is not authorized to create relation tuples on the
-            addressed Project. Body is a `PermissionDenied` problem.
+            The write is refused. Body is a `PermissionDenied` problem
+            whose `reason` says why: `insufficient_relation` when the
+            caller lacks `manage` on the addressed Project, and
+            `out_of_scope` when the caller holds it but the tuple's
+            `resource` is not governed by the addressed Project (see
+            the operation description). Nothing was written either way.
           content:
             application/problem+json:
               schema:
@@ -1868,13 +1897,26 @@ paths:
   /v1/authz/relation-tuples/{id}:
     patch:
       operationId: PatchRelationTuple
-      summary: Replace a relation tuple's contents (delete-then-write).
+      summary: Replace a relation tuple's contents.
       description: |
-        Replaces the relation tuple identified by `{id}`. The
-        handler implements Delete-then-Write semantics — the existing
-        tuple is deleted and a new tuple persisted in the same
-        transaction so cursor-paginated readers never observe a
-        half-applied state.
+        Replaces the relation tuple identified by `{id}` with the
+        triple and caveat of the body. The `id`, the owning Project and
+        the creation time stay.
+
+        The caller needs `manage` on the Project that owns the tuple,
+        and that Project must govern both the existing and the
+        replacement `resource` — the rule `CreateRelationTuple`
+        applies to the Project it is addressed to. A replacement it
+        does not govern (`platform:*`, any `domain:*`, an object of
+        another Project) is refused with `403` and
+        `reason: out_of_scope`. A replacement triple another tuple
+        already holds is refused with `409`.
+
+        The handler writes the replacement relationship first and
+        removes the existing one afterwards, only when the triple
+        changed. Every refusal and every failure of the write leaves
+        the existing tuple in place; a failure after the write answers
+        `500`, and repeating the same request completes it.
       tags:
         - authz
       parameters:
@@ -1894,14 +1936,12 @@ paths:
                 $ref: "#/components/schemas/RelationTuple"
         "400":
           description: |
-            Path `{id}` was not a non-zero UUID, body was empty, or the
-            replacement triple is not writable — the same
-            `invalid_triple` contract `CreateRelationTuple` documents,
-            including the schema rejections only the ReBAC backend can
-            make. Note that the delete leg runs first, so a
-            replacement the backend refuses leaves the old tuple
-            already deleted; the `detail` says so. Body is a
-            `Problem`.
+            Path `{id}` was not a non-zero UUID (`code:
+            invalid_tuple_id`), body was empty, or the replacement
+            triple is not writable — the same `invalid_triple` contract
+            `CreateRelationTuple` documents, including the schema
+            rejections only the ReBAC backend can make. The existing
+            tuple is unchanged. Body is a `Problem`.
           content:
             application/problem+json:
               schema:
@@ -1914,8 +1954,12 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "403":
           description: |
-            Caller is not authorized to replace the addressed relation
-            tuple. Body is a `PermissionDenied` problem.
+            The replacement is refused and the existing tuple is left in
+            place. Body is a `PermissionDenied` problem whose `reason`
+            is `insufficient_relation` when the caller lacks `manage` on
+            the Project that owns the tuple, and `out_of_scope` when
+            that Project does not govern the existing or the
+            replacement resource.
           content:
             application/problem+json:
               schema:
@@ -1923,7 +1967,16 @@ paths:
         "404":
           description: |
             Relation tuple not found. Body is a `Problem` with
-            `code: relation_tuple_not_found`.
+            `code: tuple_not_found`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: |
+            Another relation tuple already holds the replacement
+            subject, relation and resource. Nothing was changed. Body
+            is a `Problem` with `code: tuple_conflict`.
           content:
             application/problem+json:
               schema:
@@ -1946,13 +1999,20 @@ paths:
       operationId: DeleteRelationTuple
       summary: Delete a relation tuple.
       description: |
-        Deletes the relation tuple identified by `{id}`. A repeated
-        delete of the same `{id}` deliberately
-        surfaces as `404 relation_tuple_not_found` rather than `204`,
-        so a caller racing two deletes can distinguish "I deleted it"
-        from "someone else got there first" without leaking existence
-        side-channels (the read path runs the same authz check before
-        the lookup).
+        Deletes the relation tuple identified by `{id}`: the
+        relationship in the ReBAC backend, matched exactly (a subject's
+        `#relation` included), and its ledger row.
+
+        The caller needs `manage` on the Project that owns the tuple,
+        and that Project must govern the tuple's `resource` — the rule
+        `CreateRelationTuple` applies. A tuple whose resource it does
+        not govern is refused with `403` and `reason: out_of_scope`.
+
+        A repeated delete of the same `{id}` deliberately surfaces as
+        `404 tuple_not_found` rather than `204`, so a caller racing two
+        deletes can distinguish "I deleted it" from "someone else got
+        there first". A failure after the relationship is removed
+        answers `500`, and repeating the request completes it.
       tags:
         - authz
       parameters:
@@ -1963,7 +2023,7 @@ paths:
         "400":
           description: |
             Path `{id}` was not a non-zero UUID. Body is a `Problem`
-            with `code: invalid_relation_tuple_id`.
+            with `code: invalid_tuple_id`.
           content:
             application/problem+json:
               schema:
@@ -1977,7 +2037,10 @@ paths:
         "403":
           description: |
             Caller is not authorized to delete the addressed relation
-            tuple. Body is a `PermissionDenied` problem.
+            tuple. Body is a `PermissionDenied` problem whose `reason`
+            is `insufficient_relation` when the caller lacks `manage` on
+            the Project that owns the tuple, and `out_of_scope` when
+            that Project does not govern the tuple's resource.
           content:
             application/problem+json:
               schema:
@@ -1985,7 +2048,7 @@ paths:
         "404":
           description: |
             Relation tuple not found. Body is a `Problem` with
-            `code: relation_tuple_not_found`.
+            `code: tuple_not_found`.
           content:
             application/problem+json:
               schema:
@@ -4379,18 +4442,26 @@ paths:
             and a `data:` line whose payload is the canonical signed
             envelope JSON. The emitted `event:` values are
             `node_state_updated`, `policy_updated`,
-            `bridge_config_updated`, `action_request`, and
-            `session_setup`; `policy_updated` carries the
-            per-(Node, Policy) compiled-ruleset projection described by
+            `bridge_config_updated`, `action_request`,
+            `session_setup`, and `peer_endpoint_changed`;
+            `policy_updated` carries the per-(Node, Policy)
+            compiled-ruleset projection described by
             `PolicyUpdatedPayload`, `bridge_config_updated` carries the
             per-(Node, bridge Resource) delivered-config projection
             described by `BridgeConfigUpdatedPayload`, `action_request`
             carries the per-Node action dispatch described by
-            `SSEEventActionRequest`, and `session_setup` carries the
+            `SSEEventActionRequest`, `session_setup` carries the
             per-Node session provisioning payload described by
-            `SSEEventSessionSetup`. Additional discriminators land as
-            the README's 14-type taxonomy ships. Comment frames every 25
-            seconds keep idle proxies from collapsing the connection.
+            `SSEEventSessionSetup`, and `peer_endpoint_changed` carries
+            the peer endpoint change described by
+            `PeerEndpointChangedPayload`. A `peer_endpoint_changed`
+            frame is published to every OTHER Node of the Domain when
+            a peer's endpoint changes or goes stale; the recipient
+            re-pulls `GET /v1/nodes/{id}/state`, which stays the
+            authoritative source of the endpoint. Additional
+            discriminators land as the README's 14-type taxonomy
+            ships. Comment frames every 25 seconds keep idle proxies
+            from collapsing the connection.
           headers:
             X-Plexsphere-API-Version:
               description: |
@@ -4449,6 +4520,8 @@ paths:
                   $ref: "#/components/schemas/SSEEventActionRequest"
                 session_setup:
                   $ref: "#/components/schemas/SSEEventSessionSetup"
+                peer_endpoint_changed:
+                  $ref: "#/components/schemas/PeerEndpointChangedPayload"
         "400":
           description: |
             `Last-Event-ID` header was present but unparseable —
@@ -5142,6 +5215,240 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+  /v1/nodes/{id}/handshakes:
+    post:
+      operationId: PostNodeHandshakes
+      security:
+        - nskBearer: []
+      summary: Report the latest WireGuard handshake with each mesh peer.
+      description: |
+        Accepts a per-peer WireGuard handshake report from plexd: for
+        every peer the reporting Node has completed a handshake with,
+        the age of the latest handshake and the endpoint WireGuard used
+        for it. The control plane keeps the latest observation per
+        directed edge, and `GET /v1/domains/{domain_id}/mesh/topology`
+        derives each edge's `status`, `mode`, `handshake_age_seconds`
+        and `endpoint` from it. The handler:
+
+          1. Authenticates the caller against the Node Secret Key (NSK)
+             plaintext supplied in the `Authorization: Bearer` header,
+             refusing missing or revoked credentials with 401.
+          2. Asserts that the NSK belongs to the Node addressed by the
+             path `id`, refusing cross-Node use with 403
+             `node_id_mismatch` so a leaked NSK cannot report on behalf
+             of a sibling Node.
+          3. Caps the request body at 1 MiB; an oversize body receives
+             413 `handshake_report_too_large` before the JSON decoder
+             finishes.
+          4. Decodes the body without unknown fields. `observed_at` and
+             `peers` are required, `peers` holds at most 4096 entries,
+             and every entry carries a non-zero `peer_node_id`, a
+             `last_handshake_age_seconds` between 0 and 2147483647, and
+             a `peer_node_id` no other entry repeats. Any violation
+             answers 400 `malformed_handshake_report`.
+          5. Refuses an `observed_at` more than 60 seconds away from
+             server time with 400 `handshake_clock_skew`.
+          6. Parses every `endpoint` as `host:port` with a port in
+             1..65535, an address that is not unspecified, and no IPv6
+             zone. Any other value answers 400
+             `handshake_endpoint_unparseable`, naming the entry index.
+          7. Records the observations for the Node's Domain. An entry
+             that names the reporting Node itself, an unknown id, a
+             Node of another Domain, or a deregistered peer is not
+             refused: it is counted as `ignored` and stored nowhere.
+
+        The server anchors every `last_handshake_age_seconds` on its own
+        receive time: the stored handshake instant is the receive time
+        minus the age, so the agent's wall clock never enters the edge
+        status. `observed_at` only gates the request against a stalled
+        or replayed body.
+
+        Cadence contract: the agent reports once per heartbeat interval,
+        listing every peer it has completed a handshake with since its
+        WireGuard interface came up, and omits a peer with no handshake
+        yet. It assembles a fresh body (a fresh `observed_at` and fresh
+        ages) for every attempt, retries included, and never replays an
+        earlier body: a replayed age would be anchored on the later
+        receive time and make the handshake look newer than it was.
+
+        The 200 response carries `accepted_at`, the server receive time
+        every age was anchored on, and the number of entries `recorded`
+        and `ignored`.
+
+        DEFERRED-WIRING POSTURE: when the handshake recording service is
+        not wired into the composition root every request returns 501
+        with `code: handshakes_not_provisioned` so log scrapers can
+        alert on the deferred-wiring state.
+      tags:
+        - mesh
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: |
+            Node identifier (UUIDv7) of the reporting Node. Must equal
+            the NSK-authenticated calling Node.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HandshakeReportRequest"
+            example:
+              observed_at: "2026-10-21T10:15:30Z"
+              peers:
+                - peer_node_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2"
+                  last_handshake_age_seconds: 42
+                  endpoint: "198.51.100.7:51820"
+                - peer_node_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a3"
+                  last_handshake_age_seconds: 117
+                  endpoint: "[2001:db8::7]:51820"
+      responses:
+        "200":
+          description: |
+            Handshake report accepted. Every entry naming a live peer of
+            the reporting Node's Domain was stored as the latest
+            observation for its directed edge; every other entry was
+            counted as ignored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HandshakeReportResponse"
+              example:
+                accepted_at: "2026-10-21T10:15:30.123Z"
+                recorded: 2
+                ignored: 0
+        "400":
+          description: |
+            The handshake report failed validation. The Problem body's
+            `code` field disambiguates the cause and is one of the
+            following exhaustive enum values:
+
+              - `malformed_handshake_report` — the body is not valid
+                JSON, carries an unknown field, misses `observed_at`
+                or `peers`, carries a null `peers` or more than 4096
+                entries, or an entry misses `peer_node_id` or
+                `last_handshake_age_seconds`, carries a zero
+                `peer_node_id`, an age outside 0..2147483647, or a
+                `peer_node_id` another entry already named.
+              - `handshake_clock_skew` — `observed_at` drifts more than
+                60 seconds from server time. The agent refreshes
+                `observed_at` and the ages and retries.
+              - `handshake_endpoint_unparseable` — an entry's
+                `endpoint` is not a `host:port` pair, its port is 0, its
+                address is unspecified, or it carries an IPv6 zone. The
+                `detail` names the entry index.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.com/errors/handshake-endpoint-unparseable"
+                title: "Bad Request"
+                status: 400
+                detail: "peers[1].endpoint is not a host:port pair with a non-zero port, a specified address, and no zone."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/handshakes"
+                code: "handshake_endpoint_unparseable"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
+        "401":
+          description: |
+            The NSK credential in the `Authorization: Bearer` header
+            was rejected. The Problem body's `code` field
+            disambiguates the cause: `unauthorized` when the header is
+            missing or malformed, `nsk_invalid` when the presented NSK
+            cannot be resolved, and `nsk_revoked` when it resolves to
+            a revoked NSK.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.com/errors/nsk-revoked"
+                title: "Unauthorized"
+                status: 401
+                detail: "NSK presented in Authorization: Bearer has been revoked."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/handshakes"
+                code: "nsk_revoked"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
+        "403":
+          description: |
+            The NSK in the `Authorization: Bearer` header authenticates
+            successfully but belongs to a different Node than the path
+            `id`. The body's `code` field is `node_id_mismatch` so a
+            leaked NSK cannot report handshakes on behalf of a sibling
+            Node.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+              example:
+                type: "https://plexsphere.com/errors/node-id-mismatch"
+                title: "Forbidden"
+                status: 403
+                detail: "NSK is bound to a different Node than the path id."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/handshakes"
+                code: "node_id_mismatch"
+                reason: insufficient_relation
+                relation_path: []
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
+        "413":
+          description: |
+            The request body exceeded the 1 MiB ceiling the handler
+            enforces. The Problem body's `code` field is
+            `handshake_report_too_large`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.com/errors/handshake-report-too-large"
+                title: "Payload Too Large"
+                status: 413
+                detail: "request body exceeds the 1048576-byte handshake report cap."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/handshakes"
+                code: "handshake_report_too_large"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
+        "500":
+          description: |
+            Internal server error, for example a failed write of the
+            observations. Body is a `Problem` with `code: internal`; the
+            agent retries with a freshly assembled report on its next
+            heartbeat.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.com/errors/internal"
+                title: "Internal Server Error"
+                status: 500
+                detail: "the handshake report could not be recorded."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/handshakes"
+                code: "internal"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
+        "501":
+          description: |
+            The handshake report surface is not provisioned in this
+            build. The Problem body's `code` field is
+            `handshakes_not_provisioned` so log scrapers can alert on
+            the deferred-wiring state. Resolves once the handshake
+            recording service is wired into the v1 handler dependency
+            cone.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.com/errors/handshakes-not-provisioned"
+                title: "Not Implemented"
+                status: 501
+                detail: "POST /v1/nodes/{id}/handshakes requires the production wiring of the handshake recording service. The surface is not provisioned in this build."
+                instance: "/v1/nodes/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/handshakes"
+                code: "handshakes_not_provisioned"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
   /v1/nodes/{id}/secrets/{name}:
     get:
       operationId: GetNodeSecret
@@ -8058,6 +8365,62 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+  /v1/domains/{domain_id}/bootstrap-tokens:
+    get:
+      operationId: ListDomainBootstrapTokens
+      summary: List BootstrapTokens issued for every Project in a Domain.
+      description: |
+        Returns BootstrapToken metadata for every Project of the Domain
+        identified by `{domain_id}`, ordered by issuance time and id,
+        with cursor pagination. Every item names its owning Project in
+        `project_id`. The plaintext is NEVER included in this response,
+        only the hash-derived metadata view.
+
+        The caller needs `read` on the Domain. A Domain the caller cannot
+        `read` answers `403` with a `PermissionDenied` body. The Domain
+        is not looked up before the check, so an absent Domain answers
+        the same `403` and the operation declares no `404`.
+      tags:
+        - bootstrap-tokens
+      parameters:
+        - $ref: "#/components/parameters/DomainScopeID"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Page of BootstrapToken metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BootstrapTokenList"
+        "400":
+          description: |
+            Invalid path or query parameters: the nil UUID as the Domain
+            id, an out-of-range `limit`, or a malformed cursor.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Caller is not authenticated.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            Caller is not authorized to read the Domain. Body is a
+            `PermissionDenied` problem.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
   /v1/projects/{project_id}/bootstrap-tokens/{id}:
     get:
       operationId: GetBootstrapTokenMetadata
@@ -10183,6 +10546,25 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+        "503":
+          description: |
+            The cloud credential store (OpenBao) is sealed or
+            unreachable, so the credential could not be written. No
+            Cloud Credential is persisted, so a retry after recovery is
+            safe. The Problem body's `code` field is
+            `openbao_unavailable`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: "https://plexsphere.com/errors/openbao-unavailable"
+                title: "Service Unavailable"
+                status: 503
+                detail: "cloudcredentials IssueCloudCredential: the cloud credential store is temporarily unavailable"
+                instance: "/v1/clouds/0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a0/cloud-credentials"
+                code: "openbao_unavailable"
+                correlation_id: "9f4c1c2e-8a35-4d9b-b1a4-6f2f4f6f8d21"
   /v1/cloud-credentials/{id}:
     get:
       operationId: GetCloudCredential
@@ -10700,6 +11082,144 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "500":
           description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /v1/projects/{project_id}/cloud-credentials/{cloud_credential_id}/objects/{source}:
+    get:
+      operationId: ListCloudObjects
+      summary: List the cloud objects a Cloud Credential sees for a parameter source.
+      description: |
+        Lists, live, the cloud objects of one parameter source (such as
+        `openstack.flavor`) that the Cloud Credential sees in its home
+        Cloud, so a client can offer them as choices for a blueprint
+        parameter that declares the source. Each object carries its id,
+        which is the value a client submits, its name, which may be
+        empty, and an optional short detail. Items are sorted by name,
+        then id. At most 1,000 objects are returned; `truncated` is true
+        when the Cloud holds more.
+
+        Two ReBAC checks run before anything is read: the caller needs
+        `deploy` on the Project, and the Project needs `use` on the Cloud
+        Credential, the same pair `CreateResource` checks for a
+        provisioned Resource. The API then reads the credential's secret
+        material in process to authenticate against the Cloud. The
+        response carries no secret material and no secret-store
+        coordinates.
+
+        The list is advisory: `CreateResource` validates a parameter
+        value against the version's parameter schema alone, so a client
+        falls back to free text when this lookup fails. A listing is
+        cached per API replica for 60 seconds.
+      tags:
+        - cloud
+      parameters:
+        - $ref: "#/components/parameters/ResourceProjectID"
+        - $ref: "#/components/parameters/CloudObjectsCredentialID"
+        - $ref: "#/components/parameters/CloudObjectSource"
+      responses:
+        "200":
+          description: The cloud objects of the source.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CloudObjectList"
+              example:
+                items:
+                  - id: "3f1c0a52-9d4e-4b8a-a6b2-1c0e5a7d9f10"
+                    name: "m1.small"
+                    detail: "1 vCPU, 2 GiB RAM, 20 GB disk"
+                  - id: "8a2b6c1d-0e3f-4a5b-9c7d-2e4f6a8b0c12"
+                    name: "m1.large"
+                    detail: "4 vCPU, 8 GiB RAM, 80 GB disk"
+                truncated: false
+        "400":
+          description: |
+            Malformed request. Body is a `Problem` with `code` ∈
+            { `invalid_project_id`, `invalid_cloud_credential_id`,
+            `invalid_parameter_source` }: a zero Project or Cloud
+            Credential id, or a source outside the supported set.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Caller is not authenticated.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            The caller lacks `deploy` on the Project, or the Project lacks
+            `use` on the Cloud Credential. A credential id that does not
+            exist answers here too, because no Project holds `use` on it,
+            so the lookup does not reveal which ids exist. Body is a
+            `PermissionDenied` problem.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+        "404":
+          description: |
+            The Project holds `use` on a Cloud Credential whose row no
+            longer exists. Body is a `Problem` with
+            `code: cloud_credential_not_found`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: |
+            The Cloud Credential cannot authenticate: it is revoked or
+            expired, or its payload is not the provider's credentials
+            document. Body is a `Problem` with
+            `code: cloud_credential_unusable`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "422":
+          description: |
+            The source belongs to a provider other than the provider of
+            the credential's home Cloud. Body is a `Problem` with
+            `code: parameter_source_provider_mismatch`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: |
+            The deployment has not wired the cloud objects lookup. Body is
+            a `Problem` with `code: cloud_objects_not_provisioned`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "502":
+          description: |
+            The Cloud refused the credential or the listing, publishes no
+            endpoint for the source in the credential's region, could not
+            be reached, or answered something that could not be read.
+            Body is a `Problem` with `code: cloud_objects_upstream_error`
+            and a fixed detail naming which.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "503":
+          description: |
+            The credential's secret material could not be read: the
+            secret store is unavailable, or its policy does not grant the
+            API `read` on the credential paths. Body is a `Problem` with
+            `code: cloud_credential_store_unavailable`.
           content:
             application/problem+json:
               schema:
@@ -12414,6 +12934,25 @@ paths:
                       - name: "high_availability"
                         type: "boolean"
                         required: false
+                    xrd:
+                      apiVersion: "apiextensions.crossplane.io/v2"
+                      kind: "CompositeResourceDefinition"
+                      metadata:
+                        name: "xmanagedpostgres.example.org"
+                      spec:
+                        group: "example.org"
+                        names:
+                          kind: "XManagedPostgres"
+                          plural: "xmanagedpostgres"
+                    composition:
+                      apiVersion: "apiextensions.crossplane.io/v1"
+                      kind: "Composition"
+                      metadata:
+                        name: "managed-postgres"
+                      spec:
+                        compositeTypeRef:
+                          apiVersion: "example.org/v1alpha1"
+                          kind: "XManagedPostgres"
         "401":
           description: Caller is not authenticated.
           content:
@@ -12526,6 +13065,25 @@ paths:
                   - name: "storage_gb"
                     type: "integer"
                     required: true
+                xrd:
+                  apiVersion: "apiextensions.crossplane.io/v2"
+                  kind: "CompositeResourceDefinition"
+                  metadata:
+                    name: "xmanagedpostgres.example.org"
+                  spec:
+                    group: "example.org"
+                    names:
+                      kind: "XManagedPostgres"
+                      plural: "xmanagedpostgres"
+                composition:
+                  apiVersion: "apiextensions.crossplane.io/v1"
+                  kind: "Composition"
+                  metadata:
+                    name: "managed-postgres"
+                  spec:
+                    compositeTypeRef:
+                      apiVersion: "example.org/v1alpha1"
+                      kind: "XManagedPostgres"
         "400":
           description: |
             The request was rejected before any write — a malformed
@@ -13107,6 +13665,11 @@ paths:
                     status: "active"
                     provider_kinds:
                       - aws
+                    versions:
+                      - id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1"
+                        version: "v1.0.0"
+                      - id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2"
+                        version: "v1.1.0"
                     provisionable: true
                     created_at: "2026-05-02T10:00:00Z"
                     updated_at: "2026-05-02T10:00:00Z"
@@ -13116,6 +13679,9 @@ paths:
                     status: "active"
                     provider_kinds:
                       - gcp
+                    versions:
+                      - id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f3"
+                        version: "v2.0.0"
                     provisionable: false
                     created_at: "2026-05-02T10:00:00Z"
                     updated_at: "2026-05-02T10:00:00Z"
@@ -13239,7 +13805,12 @@ paths:
           description: |
             Body rejected. Body is a `Problem` with `code` ∈
             { `invalid_resource_origin`, `invalid_project_id`,
-            `invalid_body` }.
+            `invalid_body`, `invalid_resource`,
+            `invalid_parameter_values` }. `invalid_parameter_values`
+            means the Blueprint version's parameter schema refused the
+            `parameters` map; the detail names the offending parameter
+            and why, and the Resource created for the request is
+            removed again.
           content:
             application/problem+json:
               schema:
@@ -13371,6 +13942,75 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+  /v1/domains/{domain_id}/resources:
+    get:
+      operationId: ListDomainResources
+      summary: List the Resources of every Project in a Domain.
+      description: |
+        Returns an id-ordered page of the Resources owned by any Project
+        of the Domain identified by `{domain_id}`. The handler runs a
+        top-level `read` ReBAC check on the Domain BEFORE the persistence
+        read, then layers the per-row `observe` filter of
+        `ListProjectResources` on top, so the response items are the
+        subset of the persistence-level page the caller is authorised to
+        see. Every item names its owning Project in `project_id`.
+
+        A Domain the caller cannot `read` answers `403` with a
+        `PermissionDenied` body. The Domain is not looked up before the
+        check, so an absent Domain answers the same `403` and the
+        operation declares no `404`.
+
+        The pagination cursor is HMAC-signed and bound to the
+        per-(caller, pepper) pseudonym, so a cursor minted by one
+        principal cannot be replayed by another; the cross-caller replay
+        surfaces as `403 cursor_binding_mismatch`. A tampered envelope or
+        unknown version byte stays on `400 invalid_cursor`.
+      tags:
+        - resource
+      parameters:
+        - $ref: "#/components/parameters/DomainScopeID"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Page of Resources.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResourceList"
+        "400":
+          description: |
+            Invalid path or query parameters: the nil UUID as the Domain
+            id (`code: invalid_domain_id`), an out-of-range `limit`
+            (`code: invalid_limit`), or a tampered or malformed cursor
+            (`code: invalid_cursor`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Caller is not authenticated.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            Caller is not authorized to read the Domain (body is a
+            `PermissionDenied` problem) OR the pagination cursor was
+            minted by a different caller and the per-(caller, pepper)
+            HMAC binding rejected the replay (body is a `Problem` with
+            `code = cursor_binding_mismatch`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
   /v1/resources/{id}:
     get:
       operationId: GetResource
@@ -13382,9 +14022,9 @@ paths:
         reconcile loop most recently observed. For `Origin=Adopted`
         Resources the `provisioning` field is absent.
 
-        The handler runs the `observe` ReBAC check on the parent
-        Project BEFORE the persistence read; an unauthorised caller
-        therefore receives `403` without the existence side-channel a
+        The handler runs the `observe` ReBAC check on the Resource
+        BEFORE the persistence read; an unauthorised caller therefore
+        receives `403` without the existence side-channel a
         "load-then-check" flow would leak. A missing Resource surfaces
         as `404 resource_not_found`.
       tags:
@@ -13409,6 +14049,12 @@ paths:
                 provisioning:
                   phase: "Provisioning"
                   provisioned_resource_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2"
+                  blueprint_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b1"
+                  blueprint_version_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0b2"
+                  cloud_credential_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0d1"
+                  parameters:
+                    size: "small"
+                  composite_resource_name: "pr-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2"
         "401":
           description: Caller is not authenticated.
           content:
@@ -13508,6 +14154,138 @@ paths:
                 $ref: "#/components/schemas/Problem"
         "500":
           description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /v1/resources/{id}/composition:
+    get:
+      operationId: GetResourceComposition
+      summary: Read a Resource's live composition from the management cluster.
+      description: |
+        Reads the Crossplane Composite Resource behind a provisioned
+        Resource and every composed resource it lists from the
+        Project's management cluster, at request time. Nothing is
+        persisted or cached; every call is a fresh read. `GetResource`
+        and both Resource lists never wait on or fail with the
+        management cluster: this read is the only one that does.
+
+        The handler runs the `observe` ReBAC check on the Resource
+        BEFORE any read, the same check `GetResource` runs. A missing
+        Resource surfaces as `404 resource_not_found`.
+
+        `state` is one of:
+
+          * `observed` — the Composite Resource was read.
+            `composite_resource` carries its Ready state and
+            conditions, and `resources` lists each composed resource
+            in the Composite Resource's order, at most 100;
+            `truncated` reports more.
+          * `absent` — the broker holds no record for the Resource,
+            or the Composite Resource is not on the cluster yet or has
+            been deleted.
+          * `unreachable` — the cluster does not serve the
+            Blueprint's composite type, or did not answer.
+          * `not_composed` — the Resource is adopted, so no Blueprint
+            composed it.
+
+        A composed resource the API could not read keeps the
+        identity the Composite Resource named and carries a
+        `read_error`. `forbidden` means the API's cluster role does
+        not grant `get` on the kind; the operator grants it through
+        the chart value `provisioning.composedResourceApiGroups`.
+
+        `status` carries a composed resource's raw observed status as
+        the provider reports it. It is withheld, and
+        `status_withheld` is true, while the Resource may still hold
+        a redeemable bootstrap token: a node Resource in any phase
+        but `Ready`. The Composite Resource's own spec and raw status
+        are never returned.
+      tags:
+        - resource
+      parameters:
+        - $ref: "#/components/parameters/ResourceID"
+      responses:
+        "200":
+          description: The live composition, or the state that explains its absence.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResourceComposition"
+              example:
+                resource_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f1"
+                state: "observed"
+                observed_at: "2026-05-02T10:05:00Z"
+                truncated: false
+                status_withheld: false
+                composite_resource:
+                  api_version: "blueprints.plexsphere.com/v1alpha1"
+                  kind: "XOpenStackInstance"
+                  name: "pr-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2"
+                  namespace: "plexsphere-project-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"
+                  ready: "True"
+                  conditions:
+                    - type: "Ready"
+                      status: "True"
+                      reason: "Available"
+                      last_transition_time: "2026-05-02T10:04:00Z"
+                resources:
+                  - api_version: "compute.openstack.m.crossplane.io/v1alpha1"
+                    kind: "InstanceV2"
+                    name: "pr-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0f2-vm"
+                    namespace: "plexsphere-project-0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0c1"
+                    ready: "True"
+                    external_name: "6d1f4c1e-8a35-4d9b-b1a4-6f2f4f6f8d21"
+                    conditions:
+                      - type: "Ready"
+                        status: "True"
+                        reason: "Available"
+                        last_transition_time: "2026-05-02T10:04:00Z"
+                    status:
+                      atProvider:
+                        accessIpV4: "192.0.2.10"
+        "400":
+          description: |
+            Malformed Resource id. Body is a `Problem` with
+            `code: invalid_resource_id`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Caller is not authenticated.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            Caller is not authorized to read the addressed Resource.
+            Body is a `PermissionDenied` problem.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+        "404":
+          description: |
+            Resource not found. Body is a `Problem` with
+            `code: resource_not_found`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "501":
+          description: |
+            The composition root has not wired the Resource surface, or
+            has not wired the composition read for a provisioned
+            Resource. Body is a `Problem` with
+            `code: resources_not_provisioned`.
           content:
             application/problem+json:
               schema:
@@ -15635,16 +16413,25 @@ paths:
           2. Checks the `domain-view` ReBAC relation on the addressed
              Domain BEFORE any existence check so the endpoint cannot
              be used as a Domain-id oracle.
-          3. Resolves the per-Domain peer graph from the SSE peer-
-             delta projection — `nodes` carries each anchored Node's
-             mesh-IP and reachability, `edges` carries each pairwise
-             relationship with its `mode` (`direct` or `relayed`), the
-             handshake age, and the bridge Node currently serving as
-             the relay fallback when one is assigned.
+          3. Resolves the per-Domain peer graph — `nodes` carries each
+             anchored Node's mesh-IP and heartbeat-derived
+             reachability, and `edges` carries every ordered pair of
+             those Nodes. Each edge's `handshake_age_seconds` and
+             `endpoint` come from the latest WireGuard handshake the
+             source Node reported with the target through
+             `POST /v1/nodes/{id}/handshakes`, measured against
+             `generated_at`. Its `status` applies the Domain's
+             reachability policy, floored for WireGuard's session
+             timers, to that age, and reads `never_reported` when the
+             source has reported no handshake with the target. Its
+             `mode` is `relayed`, with `relay_node_id` naming the
+             bridge, when the reported endpoint equals the fallback
+             endpoint of the target's live relay assignment, and
+             `direct` otherwise.
 
-        The payload mirrors the SSE peer-graph events one-for-one so a
-        renderer that consumes the live stream and a renderer that
-        polls this pull converge on byte-identical state.
+        Edge health is computed when this endpoint is read and no
+        event stream pushes it, so a renderer refreshes `status`,
+        `handshake_age_seconds` and `endpoint` by polling this pull.
 
         DEFERRED-WIRING POSTURE: until the production composition root
         supplies the mesh-topology projection and the ReBAC
@@ -15680,6 +16467,13 @@ paths:
                     mode: direct
                     relay_node_id: null
                     status: healthy
+                    handshake_age_seconds: 42
+                    endpoint: "198.51.100.7:51820"
+                  - source_node_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2"
+                    target_node_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1"
+                    mode: direct
+                    relay_node_id: null
+                    status: never_reported
         "401":
           description: Caller is not authenticated.
           content:
@@ -20076,6 +20870,107 @@ paths:
             application/problem+json:
               schema:
                 $ref: "#/components/schemas/Problem"
+  /v1/domains/{domain_id}/sessions:
+    get:
+      operationId: ListDomainSessions
+      summary: List mediated sessions for every Project in a Domain.
+      description: |
+        Returns an issuance-ordered page of Session lifecycle metadata for
+        every Project of the Domain identified by `{domain_id}`, newest
+        first, optionally narrowed by aggregate `status`, `kind`, or
+        `identity_id`. Every item names its owning Project in
+        `project_id`. The projection is metadata-only: it carries the
+        session identity, the aggregate status, and the per-kind target,
+        but never the signed token.
+
+        The caller needs `read` on the Domain, checked BEFORE the
+        persistence read. A Domain the caller cannot `read` answers `403`
+        with a `PermissionDenied` body. The Domain is not looked up before
+        the check, so an absent Domain answers the same `403` and the
+        operation declares no `404`.
+
+        The pagination cursor is opaque and HMAC-signed by the server, so
+        a tampered cursor surfaces as `400` on the next call.
+      tags:
+        - access
+      security:
+        - operatorBearer: []
+      parameters:
+        - $ref: "#/components/parameters/DomainScopeID"
+        - in: query
+          name: status
+          required: false
+          schema:
+            $ref: "#/components/schemas/SessionStatus"
+          description: |
+            Optional aggregate-status filter. When present, only Sessions
+            whose status equals the named value are returned.
+        - in: query
+          name: kind
+          required: false
+          schema:
+            $ref: "#/components/schemas/SessionKind"
+          description: |
+            Optional kind filter. When present, only Sessions of the named
+            kind are returned.
+        - in: query
+          name: identity_id
+          required: false
+          schema:
+            type: string
+            format: uuid
+          description: |
+            Optional identity filter. When present, only Sessions issued to
+            the named Identity are returned.
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Page of Sessions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionList"
+        "400":
+          description: |
+            Invalid path or query parameters: the nil UUID as the Domain
+            id (`code: invalid_domain_id`), a tampered or malformed cursor
+            (`code: invalid_cursor`), an out-of-range `limit`
+            (`code: invalid_limit`), or a `status` / `kind` filter outside
+            its enum (`code: invalid_status`, `code: invalid_kind`).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "401":
+          description: Caller is not authenticated.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: |
+            Caller is not authorized to read the Domain. Body is a
+            `PermissionDenied` problem.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/PermissionDenied"
+        "501":
+          description: |
+            The access-orchestrator surface is not yet provisioned in this
+            build. The Problem body's `code` field is
+            `access_session_not_provisioned`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "500":
+          description: Internal server error.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
   /v1/projects/{project_id}/sessions/{session_id}:
     get:
       operationId: GetSession
@@ -23353,6 +24248,23 @@ components:
             and `cloud_credentials_not_provisioned` codes with the same
             semantics they carry above.
 
+            The cloud objects lookup
+            (`/v1/projects/{project_id}/cloud-credentials/{cloud_credential_id}/objects/{source}`)
+            adds the closed taxonomy below. Each code maps to exactly one
+            service sentinel and one HTTP status:
+
+              * `invalid_parameter_source` — 400, path `{source}` was not one of the supported parameter sources.
+              * `cloud_credential_unusable` — 409, the Cloud Credential is revoked, expired, or does not hold the provider's credentials document.
+              * `parameter_source_provider_mismatch` — 422, the source belongs to a provider other than the provider of the credential's home Cloud.
+              * `cloud_objects_upstream_error` — 502, the Cloud refused the credential or the listing, publishes no endpoint for the source, could not be reached, or answered unreadably.
+              * `cloud_credential_store_unavailable` — 503, the credential's secret material could not be read from the secret store.
+              * `cloud_objects_not_provisioned` — 501, the composition root has not wired the cloud objects lookup.
+
+            The cloud objects lookup REUSES the shared
+            `invalid_project_id`, `invalid_cloud_credential_id`, and
+            `cloud_credential_not_found` codes with the same semantics
+            they carry above.
+
             The Cloud Credentials surface REUSES the shared
             `invalid_limit`, `invalid_cursor`, `cursor_binding_mismatch`,
             `invalid_body`, `request_body_too_large`, `unauthenticated`,
@@ -23498,8 +24410,16 @@ components:
               * `invalid_resource_origin` — 400, `CreateResource` body `origin` was absent or not one of `adopted` / `provisioned`.
               * `invalid_resource_id` — 400, path `{id}` on `/v1/resources/{id}` was not a non-zero UUID.
               * `blueprint_provider_mismatch` — 422, the `CreateResource` provisioned flow named a Blueprint version whose accepted provider kinds do not include the provider of the Cloud behind the named credential. Refused before the ProvisionedResource is minted.
+              * `invalid_parameter_values` — 400, the `CreateResource` provisioned flow carried a `parameters` map the Blueprint version's parameter schema refuses: a missing required parameter, a wrong-typed value, a value outside the parameter's allowed values, or an undeclared key. The detail names the parameter.
               * `resource_not_found` — 404, the addressed Resource does not exist or is not visible.
               * `resources_not_provisioned` — 501, the composition root has not wired the Resource dependency bundle yet.
+
+            `GetResourceComposition` reuses `invalid_resource_id`,
+            `resource_not_found` and `resources_not_provisioned`; it
+            adds no code of its own. On that operation
+            `resources_not_provisioned` also answers a provisioned
+            Resource when the composition read is not wired, while the
+            rest of the Resource surface is.
 
             The Tenancy Resource surface REUSES the shared
             `invalid_project_id`, `project_not_found`, `invalid_body`,
@@ -23590,9 +24510,10 @@ components:
                 a session token because the Signing Service is
                 unreachable. No Session is persisted and no token issued,
                 so a retry after recovery is safe.
-              * `openbao_unavailable` — 503, a node-secret read could not
-                complete because the secret backend (OpenBao) is sealed or
-                unreachable. DIVERGENCE NOTE: the project README's
+              * `openbao_unavailable` — 503, a node-secret read or a
+                cloud-credential issue could not complete because the
+                secret backend (OpenBao) is sealed or unreachable.
+                DIVERGENCE NOTE: the project README's
                 degradation table uses the illustrative string
                 `secret_backend_unavailable` for this case, but the
                 shipped wire code is `openbao_unavailable`. The wire code
@@ -25874,9 +26795,11 @@ components:
       description: |
         Minimal projection of a Domain peer that the addressed Node
         needs in order to program its WireGuard table. The shape is
-        deliberately narrow and mirrors `RegisterPeer` so the
-        reconciliation pull and the registration bootstrap converge
-        on the same wire contract.
+        deliberately narrow. It shares `node_id`, `mesh_ip`,
+        `public_key` and `fallback_endpoint` with `RegisterPeer`;
+        only this projection carries `endpoint`, because an agent
+        programs its peers from the first reconciliation pull after
+        it registers.
       required:
         - node_id
         - mesh_ip
@@ -25888,6 +26811,15 @@ components:
           description: |
             Peer's Node identifier. Plexd's reconcile loop keys
             peers by id.
+        endpoint:
+          type: string
+          description: |
+            The peer's current direct WireGuard endpoint as
+            `host:port`, an IPv6 host in brackets — the NAT-observed
+            address the peer last reported through
+            `PUT /v1/nodes/{id}/endpoint`. Absent when the peer has
+            not reported one or when its observation went stale. The
+            agent dials it directly and re-reads it on every pull.
         mesh_ip:
           type: string
           minLength: 1
@@ -26250,6 +27182,68 @@ components:
             legitimate state — it means the Node no longer matches the
             bridge Resource (e.g. the Resource was deleted or its
             selector no longer captures the Node).
+    PeerEndpointChangedPayload:
+      type: object
+      description: |
+        Wire payload carried by a `peer_endpoint_changed` SSE envelope:
+        the Key and Peer Manager's outbox event, forwarded verbatim. The
+        relay publishes one envelope to every OTHER Node of the Domain
+        when a peer's NAT-observed endpoint changes, goes stale, or its
+        relay fallback moves; the Node the event is about receives none.
+        The payload names the peer, not the recipient — the recipient is
+        the Node of the SSE subscription. The envelope only pulls the
+        recipient's reconcile forward: the endpoint plexd programs is
+        the one `GET /v1/nodes/{id}/state` returns.
+      required:
+        - event_id
+        - occurred_at
+        - peer_id
+        - domain_id
+        - node_id
+        - endpoint
+        - endpoint_reported_at
+        - previous_endpoint
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          description: Identifier of the outbox event.
+        occurred_at:
+          type: string
+          format: date-time
+          description: Instant the control plane recorded the change.
+        peer_id:
+          type: string
+          format: uuid
+          description: Identifier of the Peer aggregate whose endpoint changed.
+        domain_id:
+          type: string
+          format: uuid
+          description: Domain the peer and every recipient belong to.
+        node_id:
+          type: string
+          format: uuid
+          description: |
+            The Node whose endpoint changed — the peer, not the
+            recipient of the envelope.
+        endpoint:
+          type: string
+          description: |
+            The peer's new endpoint as `host:port`, an IPv6 host in
+            brackets. Empty when the observation was withdrawn as
+            stale, in which case the pull omits the peer's `endpoint`.
+        endpoint_reported_at:
+          type: string
+          format: date-time
+          description: Instant the peer's agent attached to its endpoint report.
+        previous_endpoint:
+          type: string
+          description: The peer's endpoint before the change; empty on its first observation.
+        fallback_endpoint:
+          type: string
+          description: |
+            Relay `host:port` assigned to the peer when one is; absent
+            when none is.
     # traceability: PX-0072, S037 — Per-Node bridge-orchestrator
     # delivered-config projection blocks.
     NodeStateBridge:
@@ -26666,6 +27660,105 @@ components:
             stamps the endpoint as stale and emits a tombstone event.
             Equal to `accepted_at` plus the per-Domain endpoint TTL
             (defaults to 5 minutes).
+    HandshakeReportRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Body for POST /v1/nodes/{id}/handshakes. Carries, per mesh peer
+        the reporting Node has completed a WireGuard handshake with,
+        the age of the latest handshake and the endpoint WireGuard used
+        for it. The agent assembles a fresh body for every attempt and
+        never replays one.
+      required:
+        - observed_at
+        - peers
+      properties:
+        observed_at:
+          type: string
+          format: date-time
+          description: |
+            Agent wall-clock at the moment the report was assembled.
+            The handler rejects the request with 400
+            `handshake_clock_skew` if the value drifts more than 60
+            seconds from server time. It gates the request only; the
+            server anchors every age on its own receive time.
+        peers:
+          type: array
+          maxItems: 4096
+          description: |
+            One entry per peer the reporting Node has completed a
+            handshake with since its WireGuard interface came up. A
+            peer with no handshake yet is omitted. An empty array is a
+            valid report that records nothing.
+          items:
+            $ref: "#/components/schemas/HandshakeReportPeer"
+    HandshakeReportPeer:
+      type: object
+      additionalProperties: false
+      description: |
+        One peer entry of a handshake report: the peer Node, the age of
+        the latest completed WireGuard handshake with it, and the
+        endpoint WireGuard currently uses for it.
+      required:
+        - peer_node_id
+        - last_handshake_age_seconds
+        - endpoint
+      properties:
+        peer_node_id:
+          type: string
+          format: uuid
+          description: |
+            Node identifier of the peer. An id that names the reporting
+            Node itself, an unknown Node, a Node of another Domain, or a
+            deregistered peer is counted as ignored rather than refused.
+            No two entries of one report may name the same peer.
+        last_handshake_age_seconds:
+          type: integer
+          format: int32
+          minimum: 0
+          description: |
+            Seconds since the latest completed handshake with that peer,
+            measured by the agent when it assembled the report. The
+            server subtracts it from its own receive time to place the
+            handshake on the server clock.
+        endpoint:
+          type: string
+          maxLength: 64
+          description: |
+            The peer endpoint WireGuard currently uses, as `host:port`
+            with an IPv6 host in brackets (`[2001:db8::7]:51820`). The
+            port is in 1..65535, the address is not unspecified, and an
+            IPv6 zone is refused with 400
+            `handshake_endpoint_unparseable`.
+    HandshakeReportResponse:
+      type: object
+      description: |
+        Body for POST /v1/nodes/{id}/handshakes success responses.
+      required:
+        - accepted_at
+        - recorded
+        - ignored
+      properties:
+        accepted_at:
+          type: string
+          format: date-time
+          description: |
+            Server receive time every `last_handshake_age_seconds` of
+            the report was anchored on.
+        recorded:
+          type: integer
+          minimum: 0
+          description: |
+            Number of entries that matched a live peer of the reporting
+            Node's Domain and were stored as the latest observation of
+            their directed edge.
+        ignored:
+          type: integer
+          minimum: 0
+          description: |
+            Number of entries naming any other id: the reporting Node
+            itself, an unknown Node, a Node of another Domain, or a
+            deregistered peer.
     CapabilityManifestRequest:
       type: object
       description: |
@@ -27638,10 +28731,10 @@ components:
       type: object
       description: |
         Single directed edge in the per-Domain mesh-topology
-        projection. Mirrors a SSE peer-delta row one-for-one — a
-        renderer that consumes the live stream and a renderer that
-        polls `GET /v1/domains/{domain_id}/mesh/topology` converge on
-        byte-identical state.
+        projection. Its `status`, `mode`, `relay_node_id`,
+        `handshake_age_seconds` and `endpoint` are derived when
+        `GET /v1/domains/{domain_id}/mesh/topology` is read; no event
+        stream pushes them.
       required:
         - source_node_id
         - target_node_id
@@ -27668,10 +28761,11 @@ components:
             - direct
             - relayed
           description: |
-            `direct` when the edge is using a direct WireGuard
-            handshake against the peer's NAT-observed endpoint;
-            `relayed` when the bridge fallback endpoint assigned to
-            this pair is currently in use.
+            `relayed` when `endpoint` equals the fallback endpoint of
+            the target Node's live relay assignment, so the source
+            reaches the target through that assignment's bridge;
+            `direct` otherwise, including when the source has reported
+            no handshake with the target.
         # DECISION: `relay_node_id` keeps the 3.0 `nullable: true`
         # encoding — it is a required key that genuinely carries `null`
         # (mode `direct`), and the pinned oapi-codegen rejects the 3.1
@@ -27682,9 +28776,9 @@ components:
           format: uuid
           nullable: true
           description: |
-            Bridge Node currently serving as the relay fallback for
-            this edge. Always populated when `mode` is `relayed`;
-            always `null` when `mode` is `direct`.
+            Bridge Node of the target Node's live relay assignment whose
+            fallback endpoint this edge uses. Always populated when
+            `mode` is `relayed`; always `null` when `mode` is `direct`.
         status:
           type: string
           enum:
@@ -27693,29 +28787,49 @@ components:
             - unreachable
             - never_reported
           description: |
-            Derived edge health, computed by applying the per-Domain
-            reachability policy thresholds to the per-edge handshake
-            observation. The handshake telemetry itself is deliberately
-            NOT exposed on this envelope; a follow-up extends the
-            `MeshTopology` envelope with the per-edge handshake
-            observation. Uses the same enum values as
-            the per-Node `Reachability` projection so a single renderer
-            can colour both surfaces from one mapping.
+            Derived edge health, computed from `handshake_age_seconds`
+            with the Domain's reachability policy, floored for
+            WireGuard's session timers. The edge reads `stale` once the
+            age reaches the larger of the policy's stale threshold and
+            180 seconds (WireGuard's reject-after time) plus one
+            heartbeat interval, and `unreachable` once it reaches the
+            larger of the policy's unreachable threshold and twice that
+            stale threshold: 210 and 420 seconds under the default
+            policy. `never_reported` means the source has reported no
+            handshake with the target. Uses the same enum values as the
+            per-Node `Reachability` projection so a single renderer can
+            colour both surfaces from one mapping.
+        handshake_age_seconds:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Seconds between the latest WireGuard handshake the source
+            Node reported with the target and `generated_at`. Absent
+            when the source has reported no handshake with the target.
+        endpoint:
+          type: string
+          description: |
+            The endpoint, as `host:port` with an IPv6 host in brackets,
+            the source Node's WireGuard used for that handshake. Absent
+            when the source has reported no handshake with the target.
       example:
         source_node_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1"
         target_node_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2"
         mode: direct
         relay_node_id: null
         status: healthy
+        handshake_age_seconds: 42
+        endpoint: "198.51.100.7:51820"
     MeshTopology:
       type: object
       description: |
         Envelope returned by `GET /v1/domains/{domain_id}/mesh/topology`.
         Carries a snapshot of every anchored Node in the Domain and
         the directed edges between them, captured at `generated_at`.
-        The snapshot is a coherent read of the SSE peer-delta
-        projection — partial pages are never emitted; a renderer can
-        replace the entire view on each pull.
+        The snapshot is read in one request — partial pages are
+        never emitted; a renderer can replace the entire view on each
+        pull.
       required:
         - domain_id
         - generated_at
@@ -27768,6 +28882,13 @@ components:
             mode: direct
             relay_node_id: null
             status: healthy
+            handshake_age_seconds: 42
+            endpoint: "198.51.100.7:51820"
+          - source_node_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a2"
+            target_node_id: "0190a8b8-a0c0-7a0a-8a0a-a0a0a0a0a0a1"
+            mode: direct
+            relay_node_id: null
+            status: never_reported
     MeshTopologyNode:
       type: object
       description: |
@@ -29832,6 +30953,51 @@ components:
             when the iteration has reached end-of-stream. The encoding
             is HMAC-signed by the server so a tampered cursor surfaces
             as `400` on the next call.
+    CloudObject:
+      type: object
+      description: |
+        One cloud object a Cloud Credential sees: something its home
+        Cloud holds that a blueprint parameter can name, such as a
+        flavor, an image, a network or an availability zone.
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+          minLength: 1
+          description: |
+            The object's id in the Cloud, which is the value a client
+            submits for the parameter. An availability zone's id is its
+            name.
+        name:
+          type: string
+          description: The object's name. It may be empty; ids are unique, names are not.
+        detail:
+          type: string
+          description: |
+            Optional short hint about the object, such as a flavor's
+            size or an image's visibility. Absent when the object has
+            none.
+    CloudObjectList:
+      type: object
+      description: |
+        The cloud objects of one parameter source, returned by
+        `ListCloudObjects`, sorted by name and then id.
+      required:
+        - items
+        - truncated
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/CloudObject"
+          description: The cloud objects. Empty when the Cloud holds none of the source.
+        truncated:
+          type: boolean
+          description: |
+            True when the Cloud holds more objects than the 1,000 the
+            list carries. A client still accepts a typed id.
     CloudCredentialAttachRequest:
       type: object
       description: |
@@ -29935,7 +31101,11 @@ components:
         NOT the flattened array the `BlueprintVersionResponse` read
         surface projects. Authorship and read shapes differ on purpose:
         authors submit the document the aggregate parses, readers receive
-        the projected parameter list.
+        the projected parameter list. The document spells a parameter's
+        set of allowed values `allowedValues`, and the read projection
+        names the same set `allowed_values`. A parameter's `source`, the
+        kind of cloud object whose id it takes, is spelled `source` in
+        both; its provider kind must be one of `provider_kinds`.
       required:
         - version
         - xrd
@@ -29968,7 +31138,7 @@ components:
           additionalProperties: true
           description: |
             Typed parameter-schema document of the form
-            `{"parameters":[{"name":…,"type":…,"required":…,"default"?:…}]}`.
+            `{"parameters":[{"name":…,"type":…,"required":…,"default"?:…,"description"?:…,"allowedValues"?:[…],"source"?:…}]}`.
             A structurally invalid document surfaces as
             `400 invalid_parameter_schema`.
         provider_kinds:
@@ -30056,21 +31226,62 @@ components:
             declares one; its JSON type matches `type`. Absent for
             required parameters and for optional parameters with no
             declared default.
+        description:
+          type: string
+          description: |
+            Optional human-readable meaning of the parameter, as the
+            Blueprint author declared it. At most 1024 bytes. Clients
+            render it as plain text, never as Markdown or HTML. Absent
+            when the parameter declares no description.
+        allowed_values:
+          type: array
+          minItems: 1
+          items:
+            oneOf:
+              - type: integer
+              - type: string
+          description: |
+            Optional closed set of values the parameter accepts, in
+            declaration order. Present only on a `string` or `integer`
+            parameter that declares a set; each value's JSON type
+            matches `type`. A declared `default` is one of the values.
+            Provisioning refuses any other value with
+            `400 invalid_parameter_values`. The authoring document
+            spells the key `allowedValues`.
+        source:
+          type: string
+          enum:
+            - openstack.availability-zone
+            - openstack.external-network
+            - openstack.flavor
+            - openstack.image
+            - openstack.network
+          description: |
+            Optional kind of cloud object whose id the parameter takes.
+            Present only on a `string` parameter that declares one, and
+            never together with `allowed_values`. A client that knows the
+            Cloud Credential a request will use offers the cloud objects
+            of this kind as choices, listed through `ListCloudObjects`;
+            the value it submits is the chosen object's id. The list is
+            advisory: provisioning validates the value against `type`
+            alone. The authoring document spells the key `source` too.
     BlueprintVersionResponse:
       type: object
       description: |
         A single version of a Blueprint. A version is keyed by its
         parent Blueprint and its `version` string and carries the
         typed `parameter_schema` an operator fills in when
-        provisioning a Resource. The Crossplane XRD and Composition
-        manifests are storage-internal and are deliberately not
-        exposed on this read surface.
+        provisioning a Resource. Every caller who may read the parent
+        Blueprint also receives the version's Crossplane XRD and
+        Composition manifests as `xrd` and `composition`.
       required:
         - id
         - version
         - provider_kinds
         - injection_strategy
         - parameter_schema
+        - xrd
+        - composition
         - created_at
       properties:
         id:
@@ -30117,6 +31328,20 @@ components:
             Typed parameter declarations an operator fills in when
             provisioning a Resource from this version. May be empty
             when the version declares no parameters.
+        xrd:
+          type: object
+          additionalProperties: true
+          description: |
+            Crossplane CompositeResourceDefinition manifest as a JSON
+            object, returned as it was published or imported. The
+            manifest is neither re-rendered nor re-validated on read.
+        composition:
+          type: object
+          additionalProperties: true
+          description: |
+            Crossplane Composition manifest as a JSON object, returned
+            as it was published or imported. The manifest is neither
+            re-rendered nor re-validated on read.
         created_at:
           type: string
           format: date-time
@@ -30221,6 +31446,7 @@ components:
         - display_name
         - status
         - provider_kinds
+        - versions
         - provisionable
         - created_at
         - updated_at
@@ -30269,6 +31495,14 @@ components:
             accept, deduplicated and sorted ascending. Empty when the
             Blueprint has no published version, which also makes
             `provisionable` false.
+        versions:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProjectBlueprintOfferVersion"
+          description: |
+            The Blueprint's published versions, oldest first. Each carries
+            the `id` a Resource create names as `blueprint_version_id`.
+            `[]` when the Blueprint has no published version.
         provisionable:
           type: boolean
           description: |
@@ -30284,6 +31518,24 @@ components:
           type: string
           format: date-time
           description: Last-modified timestamp (UTC).
+    ProjectBlueprintOfferVersion:
+      type: object
+      description: |
+        One published version of an offered Blueprint: the identifier a
+        Resource create names and the version label.
+      required:
+        - id
+        - version
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: |
+            BlueprintVersion identifier, the value `blueprint_version_id`
+            takes on a Resource create.
+        version:
+          type: string
+          description: Published version label, for example `v1.2.0`.
     ProjectBlueprintList:
       type: object
       description: |
@@ -30809,7 +32061,11 @@ components:
             Typed parameter values for `origin=provisioned`, validated
             against the BlueprintVersion's typed `parameter_schema`.
             Omit on `origin=adopted`. The wire envelope is opaque
-            here; type-shape rejections surface at the handler.
+            here; a map the schema refuses (a missing required
+            parameter, a wrong-typed value, a value outside its
+            allowed values, or an undeclared key) surfaces as `400`
+            with `code: invalid_parameter_values`, naming the
+            parameter in `detail`.
     ResourceProvisioning:
       type: object
       description: |
@@ -30817,9 +32073,20 @@ components:
         Resource. Absent on `Origin=Adopted` Resources. The phase is
         the reconcile loop's most recently observed snapshot and is
         guaranteed to advance only toward a terminal.
+
+        The provenance fields name the Blueprint, the Blueprint
+        version and the Cloud Credential the Resource was provisioned
+        from by id. A client resolves their names through the
+        Blueprint and Cloud Credential reads, which apply their own
+        permission checks.
       required:
         - phase
         - provisioned_resource_id
+        - blueprint_id
+        - blueprint_version_id
+        - cloud_credential_id
+        - parameters
+        - composite_resource_name
       properties:
         phase:
           $ref: "#/components/schemas/ProvisionedResourcePhase"
@@ -30829,6 +32096,217 @@ components:
           description: |
             Identifier of the broker-owned ProvisionedResource bound
             to this Resource (UUIDv7).
+        blueprint_id:
+          type: string
+          format: uuid
+          description: |
+            Identifier of the Blueprint whose version the Resource was
+            provisioned from.
+        blueprint_version_id:
+          type: string
+          format: uuid
+          description: |
+            Identifier of the BlueprintVersion the Resource was
+            provisioned from.
+        cloud_credential_id:
+          type: string
+          format: uuid
+          description: |
+            Identifier of the Cloud Credential the substrate is
+            provisioned with.
+        parameters:
+          type: object
+          additionalProperties: true
+          description: |
+            The parameter values the Resource was provisioned with,
+            validated against the BlueprintVersion's parameter schema.
+            `{}` when none were given.
+        composite_resource_name:
+          type: string
+          description: |
+            Name of the Crossplane Composite Resource the broker
+            applies for this Resource, in the namespace
+            `plexsphere-project-<project_id>` on the Project's
+            management cluster.
+    ResourceComposition:
+      type: object
+      description: |
+        A Resource's live composition as the management cluster
+        reported it at `observed_at`. `composite_resource` is present
+        only when `state` is `observed`. `message` explains every
+        other state.
+      required:
+        - resource_id
+        - state
+        - observed_at
+        - resources
+        - truncated
+        - status_withheld
+      properties:
+        resource_id:
+          type: string
+          format: uuid
+          description: The Resource the composition belongs to.
+        state:
+          $ref: "#/components/schemas/CompositionState"
+        message:
+          type: string
+          description: |
+            Operator-facing explanation of an `absent`,
+            `unreachable` or `not_composed` state.
+        observed_at:
+          type: string
+          format: date-time
+          description: When the API read the management cluster.
+        composite_resource:
+          $ref: "#/components/schemas/ManagementClusterObject"
+        resources:
+          type: array
+          description: |
+            The composed resources the Composite Resource lists, in
+            its order. Empty for every state but `observed`.
+          items:
+            $ref: "#/components/schemas/ManagementClusterObject"
+        truncated:
+          type: boolean
+          description: |
+            The Composite Resource lists more composed resources than
+            the 100 one read returns.
+        status_withheld:
+          type: boolean
+          description: |
+            The composed resources' raw `status` was left out because
+            the Resource may still hold a redeemable bootstrap token.
+    CompositionState:
+      type: string
+      description: |
+        Outcome of one live composition read. `observed`: the
+        Composite Resource was read. `absent`: there is no broker
+        record or no Composite Resource on the cluster.
+        `unreachable`: the cluster does not serve the composite type
+        or did not answer. `not_composed`: the Resource is adopted.
+      enum:
+        - observed
+        - absent
+        - unreachable
+        - not_composed
+      # x-enum-varnames pins the generated Go constant names. Without it,
+      # oapi-codegen's "prefix only on collision" heuristic would prefix
+      # the existing unprefixed constants that share `absent`
+      # (LabelSelectorASTNodeOp) and `unreachable` (ReachabilityState)
+      # and break every caller that references them.
+      x-enum-varnames:
+        - CompositionStateObserved
+        - CompositionStateAbsent
+        - CompositionStateUnreachable
+        - CompositionStateNotComposed
+    ManagementClusterObject:
+      type: object
+      description: |
+        One object of a composition as the management cluster
+        reports it. An object the API could not read keeps the
+        identity the Composite Resource named and carries a
+        `read_error`.
+      required:
+        - api_version
+        - kind
+        - name
+        - ready
+        - conditions
+      properties:
+        api_version:
+          type: string
+          description: The object's apiVersion, for example `compute.openstack.m.crossplane.io/v1alpha1`.
+        kind:
+          type: string
+          description: The object's kind.
+        name:
+          type: string
+          description: The object's name.
+        namespace:
+          type: string
+          description: The object's namespace on the management cluster.
+        ready:
+          type: string
+          description: |
+            Status of the object's `Ready` condition; `Unknown` when it
+            reports none or could not be read.
+          enum:
+            - "True"
+            - "False"
+            - Unknown
+          # x-enum-varnames pins the generated Go constant names so the
+          # values never collide with another enum's True, False or
+          # Unknown.
+          x-enum-varnames:
+            - ManagementClusterObjectReadyTrue
+            - ManagementClusterObjectReadyFalse
+            - ManagementClusterObjectReadyUnknown
+        external_name:
+          type: string
+          description: |
+            The `crossplane.io/external-name` annotation: the
+            object's identity at the provider.
+        conditions:
+          type: array
+          description: The object's `status.conditions`.
+          items:
+            $ref: "#/components/schemas/ManagementClusterCondition"
+        status:
+          type: object
+          additionalProperties: true
+          description: |
+            The object's raw observed `status`, as the provider
+            reports it, without `atProvider.manifest`, where a wrapper
+            provider such as provider-kubernetes mirrors the whole
+            object it manages. Absent on the Composite Resource, on an
+            object that was not read or reports none, and while the
+            composition's `status_withheld` is true.
+        read_error:
+          $ref: "#/components/schemas/ManagementClusterReadError"
+    ManagementClusterReadError:
+      type: string
+      description: |
+        Why one composed resource could not be read. `forbidden`: the
+        API's cluster role grants no `get` on the kind. `missing`: the
+        Composite Resource lists it but the cluster has none.
+        `not_served`: the cluster does not serve the kind. `failed`:
+        the reference was malformed or the read failed otherwise.
+      enum:
+        - forbidden
+        - missing
+        - not_served
+        - failed
+      # x-enum-varnames pins the generated Go constant names so the
+      # values never collide with another enum's members.
+      x-enum-varnames:
+        - ManagementClusterReadErrorForbidden
+        - ManagementClusterReadErrorMissing
+        - ManagementClusterReadErrorNotServed
+        - ManagementClusterReadErrorFailed
+    ManagementClusterCondition:
+      type: object
+      description: One entry of a cluster object's `status.conditions`.
+      required:
+        - type
+        - status
+      properties:
+        type:
+          type: string
+          description: The condition type, for example `Ready` or `Synced`.
+        status:
+          type: string
+          description: The condition status, `True`, `False` or `Unknown`.
+        reason:
+          type: string
+          description: The machine-readable reason.
+        message:
+          type: string
+          description: The human-readable message.
+        last_transition_time:
+          type: string
+          format: date-time
+          description: When the condition last changed status.
     ResourceResponse:
       type: object
       description: |
@@ -30962,6 +32440,14 @@ components:
           description: |
             Identifier of the Cloud Credential bound to the Project by
             this assignment.
+        cloud_credential_display_name:
+          type: string
+          description: |
+            Display name of the assigned Cloud Credential, the label
+            pickers show beside `cloud_credential_id`. Present when the
+            credential row resolves; absent when it no longer exists, and
+            on a request, grant or revoke response whose name lookup
+            failed after the write committed.
         state:
           $ref: "#/components/schemas/CredentialAssignmentState"
         materialised:
@@ -37097,7 +38583,35 @@ components:
         `/v1/projects/{project_id}/resources` for the Resource
         collection — create and list. Reused by the Bridge Orchestrator
         surface under
-        `/v1/projects/{project_id}/resources/{resource_id}/bridge/...`.
+        `/v1/projects/{project_id}/resources/{resource_id}/bridge/...`,
+        and by the cloud objects lookup under
+        `/v1/projects/{project_id}/cloud-credentials/{cloud_credential_id}/objects/{source}`.
+    CloudObjectsCredentialID:
+      in: path
+      name: cloud_credential_id
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: |
+        Cloud Credential identifier (UUIDv7) whose home Cloud the cloud
+        objects lookup lists. Bound on
+        `/v1/projects/{project_id}/cloud-credentials/{cloud_credential_id}/objects/{source}`.
+    CloudObjectSource:
+      in: path
+      name: source
+      required: true
+      schema:
+        type: string
+        enum:
+          - openstack.availability-zone
+          - openstack.external-network
+          - openstack.flavor
+          - openstack.image
+          - openstack.network
+      description: |
+        Parameter source naming the kind of cloud object to list. A value
+        outside the set is refused with `400 invalid_parameter_source`.
     # traceability: PX-0072, S037 — Bridge Orchestrator path parameters.
     BridgeResourceID:
       in: path
@@ -37304,7 +38818,8 @@ components:
       description: |
         Owning Domain identifier (UUIDv7). Bound on the Domain-scoped
         operator surfaces — capacity, mesh topology, managed-push,
-        observability queries, alert rules, and incidents.
+        observability queries, alert rules, incidents, and the
+        Domain-wide Resource, BootstrapToken and Session lists.
     AuditDomainID:
       in: path
       name: domain_id
